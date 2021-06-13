@@ -1,7 +1,7 @@
 
-(defpackage :analyze-del
+(defpackage :deliscope
   (:use :common-lisp)
-  (:nicknames :ad)
+  (:nicknames :ds)
   (:shadow sequence)
   (:export
    #:*minimum-phred-quality*

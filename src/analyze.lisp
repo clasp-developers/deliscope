@@ -1,4 +1,4 @@
-(in-package :analyze-del)
+(in-package :deliscope)
 
 (defparameter *simple-score* (sa:make-simple-score 0 -1 -2))
 (defparameter *align-config* (sa:make-align-config :t-nil-nil-t))
@@ -8,9 +8,22 @@
 (defparameter *low-quality-max* 2)
 (defparameter *minimum-counts* 100)
 
+(defclass parser ()
+  ((name :initarg :name :accessor name)
+   (files :initarg :files :accessor files)
+   (num-sequences-per-file :initarg :num-sequences-per-file :accessor num-sequences-per-file)
+   (pass-file-name :initarg :pass-file-name :accessor pass-file-name)
+   (fail-file-name :initarg :fail-file-name :accessor fail-file-name)
+   (output-file-name :initarg :output-file-name :accessor output-file-name)
+   (overwrite :initarg :overwrite :accessor overwrite)
+   ))
+
 (defclass analysis ()
-  ((file-names :initarg :file-names :accessor file-names)
+  ((name :initarg :name :accessor name)
+   (file-names :initarg :file-names :accessor file-names)
    (sequences :initform (make-hash-table :test 'equal) :initarg :sequences :accessor sequences)
+   (start-time :initarg :start-time :accessor start-time)
+   (current-time :initarg :current-time :accessor current-time)
    (total-sequence-count :initform 0 :initarg :total-sequence-count :accessor total-sequence-count)
    (good-sequence-count :initform 0 :initarg :good-sequence-count :accessor good-sequence-count)))
 
@@ -238,15 +251,8 @@
 
 
 (defvar *analysis* (make-hash-table :test 'equal))
-(defvar *original-analysis* (make-instance 'analysis))
-(defvar *common-sequences* (make-hash-table :test 'equal))
 (defvar *bead-specific (make-hash-table :test 'equal))
 
-
-(defun clear-analysis (&optional file-names)
-  (setf *original-analysis* (make-instance 'analysis
-                                           :file-names file-names))
-  (clrhash *common-sequences*))
 
 (defun accept-result (result)
   (and result
@@ -254,70 +260,98 @@
        (every (lambda (x) (< (low-quality-count x) *low-quality-max*)) result)))
 
   
-(defun analyze-seq-file (file-name seq-file &key (num 10) verbose pass-file fail-file)
+(defun analyze-seq-file (analysis file-name seq-file count total-count local-file-count progress-callback pass-file fail-file &key verbose)
   (let ((title (sa:make-string :char-string))
         (seq (sa:make-string :dna5q-string))
-        (align (sa:make-align :dna5q-string)))
-    (loop named read-loop
-          for index from 0
-          for res = (progn
-                      (when (sa:at-end seq-file) (return-from read-loop nil))
-                      (sa:read-record title seq seq-file)
-                      (analyze-sequence align seq :verbose verbose))
-          unless (and num (< num 100000))
-            do (when (= 0 (mod index 100000))
-                 (format t "Done ~a ~a~%" index file-name))
-          do (incf (total-sequence-count *original-analysis*))
-          when (and num (>= index num))
-            do (return-from read-loop nil)
-          if (accept-result res)
-            do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
-                 (incf (good-sequence-count *original-analysis*))
-                 (incf (gethash key (sequences *original-analysis*) 0))
-                 (when pass-file (sa:write-record pass-file title seq)))
-          else
-            do (when fail-file (sa:write-record fail-file title seq)))
-    (format t "Read ~a total sequences and ~a good sequences - there are ~a unique sequences~%"
-            num (good-sequence-count *original-analysis*)
-            (hash-table-count (sequences *original-analysis*)))))
+        (align (sa:make-align :dna5q-string))
+        (next-progress-update (if (> (+ count 10000) total-count)
+                                  total-count
+                                  (+ count 10000))))
+    (labels ((update-progress (count progress)
+               (let* ((current-time (get-internal-real-time))
+                      (elapsed-seconds (float (/ (- current-time (start-time analysis)) internal-time-units-per-second)))
+                      (remaining-seconds (- (* (/ total-count count) elapsed-seconds) elapsed-seconds))
+                      (remaining-minutes (/ remaining-seconds 60.0))
+                      (remaining-hours (/ remaining-minutes 60.0)))
+                 (multiple-value-bind (hours minutes)
+                     (floor remaining-hours)
+                   (let ((msg (format nil "Read ~a of ~a~%Good sequences ~a (~4,2f\%)~%Remaining remaining time: ~a hours ~4,2f minutes~%~a~%"
+                                      count total-count
+                                      (good-sequence-count analysis)
+                                      (if (> count 0)
+                                          (* 100.0 (/ (good-sequence-count analysis) count))
+                                          0.0)
+                                      hours
+                                      (* 60.0 minutes)
+                                      (namestring file-name))))
+                     (mp:check-pending-interrupts)
+                     (incf next-progress-update 10000)
+                     (when (> next-progress-update total-count)
+                       (setf next-progress-update total-count))
+                     (funcall progress-callback progress msg))))))
+      (loop named read-loop
+            for index from 0
+            for res = (progn
+                        (when (sa:at-end seq-file)
+                          (update-progress count progress)
+                          (return-from read-loop count))
+                        (sa:read-record title seq seq-file)
+                        (analyze-sequence align seq :verbose verbose))
+            for progress = (floor (* 100.0 (/ count total-count)))
+            when (>= count next-progress-update)
+              do (update-progress count progress)
+            unless (< index local-file-count)
+              do (return-from read-loop count)
+            do (incf count)
+            if (accept-result res)
+              do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
+                   (incf (good-sequence-count analysis))
+                   (incf (gethash key (sequences analysis) 0))
+                   (when pass-file (sa:write-record pass-file title seq)))
+            else
+              do (when fail-file (sa:write-record fail-file title seq))
+            finally (return-from read-loop count)))))
 
-(defun analyze (seq-file-path &key (num 10) verbose pass-file-name fail-file-name)
+(defun analyze (analysis seq-file-path count total-count local-file-count progress-callback pass-file fail-file &key verbose)
   (unless (probe-file seq-file-path)
     (error "Could not find file ~a" seq-file-path))
   (let ((seq-file (sa:make-seq-file-in seq-file-path)))
-    (let ((pass-file (when pass-file-name
-                       (sa:make-seq-file-out pass-file-name)))
-          (fail-file (when fail-file-name
-                       (sa:make-seq-file-out fail-file-name))))
-      (analyze-seq-file seq-file-path seq-file :num num :verbose verbose
-                                               :pass-file pass-file
-                                               :fail-file fail-file))))
+    (unwind-protect
+         (progn
+           (setf count (analyze-seq-file analysis seq-file-path seq-file count total-count local-file-count
+                                        progress-callback pass-file fail-file :verbose verbose))
+           (unless count
+             (error "Count needs to be an integer")))
+      (sa:close seq-file)))
+  count)
 
-(defun serial-analyze (sequence-files &key (num 10) pass-file-name fail-file-name)
-  (clear-analysis sequence-files)
-  (loop for file in sequence-files
-        do (unless (probe-file file)
-             (error "Could not find file: ~a~%" file)))
-  (loop for file in sequence-files
-        do (analyze file :num num :pass-file-name pass-file-name :fail-file-name fail-file-name))
-  (format t "Finished.~%"))
+(defun serial-analyze (parser &key progress-callback)
+  "Read sequences and generate an analysis"
+  (let* ((analysis (make-instance 'analysis
+                                  :name (name parser)
+                                  :start-time (get-internal-real-time) 
+                                  :file-names (files parser)))
+         (pass-file (sa:make-seq-file-out (namestring (pass-file-name parser))))
+         (fail-file (sa:make-seq-file-out (namestring (fail-file-name parser)))))
+    (unwind-protect
+         (progn
+           (loop for file in (files parser)
+                 do (unless (probe-file file)
+                      (error "Could not find file: ~a~%" file)))
+           (let ((total-count (apply '+ (num-sequences-per-file parser)))
+                 (count 0))
+             (loop for file in (files parser)
+                   for local-file-count in (num-sequences-per-file parser)
+                   do (progn
+                        (setf count (analyze analysis file count total-count local-file-count progress-callback pass-file fail-file))
+                        (unless (integerp count)
+                          (error "count is not an integer"))))))
+      (sa:close pass-file)
+      (sa:close fail-file))
+    (save-results analysis (output-file-name parser) :overwrite (overwrite parser))
+    (funcall progress-callback nil nil :wrote-results-to (output-file-name parser))
+    (format t "Finished analysis.~%")))
   
-
-(defun parallel-analyze (sequence-files &key (num 10))
-  (clear-analysis)
-  (loop for file in sequence-files
-        do (unless (probe-file file)
-             (error "Could not find file: ~a~%" file)))
-  (let ((threads (loop for tinum from 0
-                       for file in sequence-files
-                       for thread = (mp:process-run-function
-                                      (format nil "process~d" tinum)
-                                      (lambda ()
-                                        (analyze file :num num)))
-                       collect thread)))
-    (loop for thread in threads
-          do (mp:process-join thread))))
-
 (defun save-csv (vals file)
   (with-open-file (fout file :direction :output)
     (loop for row in vals
@@ -325,7 +359,7 @@
                (format fout "~{ ~s~^,~}," (car row)))
           do (format fout "~{ ~s~^,~}~%" (cdr row)))))
 
-(defun sequence-survey (seq &optional (analysis *original-analysis*))
+(defun sequence-survey (seq analysis)
   (let ((ht (make-hash-table :test 'equal)))
     (maphash (lambda (k v)
                (let ((seq-key (subseq k 1 4)))
@@ -367,38 +401,41 @@
              library-codes)
     nil))
 
-(defun bead-codes ()
+(defun bead-codes (analysis)
   "Gather the sequences and count how many times they appear with different bead codes"
   (let ((bead-codes (make-hash-table :test 'equal)))
     (maphash (lambda (key value)
                (let ((library-code (subseq key 0 2)))
                  (incf (gethash library-code bead-codes 0) value)))
-             (sequences *original-analysis*))
+             (sequences analysis))
     bead-codes))
     
-(defun save-results (file &key force)
+(defun save-results (analysis file &key overwrite)
   "Save the results to a file. Pass :force t if you want to force overwriting an existing file"
-  (when (and (not force) (probe-file file))
+  (when (and (not overwrite) (probe-file file))
     (error "The file ~a already exists~%" file))
-  (with-open-file (fout file :direction :output)
+  (with-open-file (fout file :direction :output :if-exists (if overwrite :supersede))
     (let ((*print-readably* t)
           (*print-pretty* nil))
-      (princ (file-names *original-analysis*) fout)
+      (prin1 (name analysis) fout)
       (terpri fout)
-      (princ (total-sequence-count *original-analysis*) fout)
+      (prin1 (file-names analysis) fout)
       (terpri fout)
-      (princ (good-sequence-count *original-analysis*) fout)
+      (prin1 (total-sequence-count analysis) fout)
       (terpri fout)
-      (princ (hash-table-count (sequences *original-analysis*)) fout)
+      (prin1 (good-sequence-count analysis) fout)
+      (terpri fout)
+      (prin1 (hash-table-count (sequences analysis)) fout)
       (terpri fout)
       (maphash (lambda (k v)
                  (format fout "~s ~s~%" k v))
-               (sequences *original-analysis*))))
+               (sequences analysis))))
   (format t "Saved to ~a~%" file))
 
 (defun load-results (file)
-  (with-open-file (fin file :direction :input)
+  (with-open-file (fin (merge-pathnames file) :direction :input)
     (let ((analysis (make-instance 'analysis)))
+      (setf (name analysis) (read fin))
       (setf (file-names analysis) (read fin))
       (setf (total-sequence-count analysis) (read fin))
       (setf (good-sequence-count analysis) (read fin))

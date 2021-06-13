@@ -11,4 +11,5 @@
   ((:file "package")
    (:file "filter")
    (:file "analyze")
+   (:file "widgets")
    ))

@@ -1,4 +1,4 @@
-(in-package :analyze-del)
+(in-package :deliscope)
 
 (defun quality-summary ()
   (loop for qcode in '(#\E #\A #\< #\6 #\/ #\!)
