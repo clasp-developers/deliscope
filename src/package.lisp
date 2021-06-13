@@ -28,6 +28,7 @@
 
 
    #:compare
+   #:create-sequence-parser
    #:filtered-library-codes
    #:summarize
    ))
