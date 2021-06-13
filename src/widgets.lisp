@@ -92,3 +92,21 @@
                                         (setf (jw:widget-value messages) "Stopped parsing.")
                                         )))
     (holder progress)))
+
+
+(defun plot-counts (data title)
+  (let* ((x-data (coerce (subseq (mapcar #'car data) 0) 'vector))
+         (y-data (coerce (subseq (mapcar #'cdr data) 0) 'vector)))
+    (dv:bar-plot x-data
+                 y-data
+                 :width 600
+                 :x-title "index" :y-title "Log10 counts"
+                 :title title)))
+
+(defun plot-unfiltered-counts (analysis)
+  (let ((data (sequence-counts (sequences analysis))))
+    (plot-counts data (format nil "~a unfiltered counts" (name analysis)))))
+
+(defun plot-filtered-counts (analysis)
+  (let ((data (sequence-counts (filtered-sequences analysis))))
+    (plot-counts data (format nil "~a filtered counts" (name analysis)))))

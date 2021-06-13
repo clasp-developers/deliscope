@@ -18,7 +18,7 @@
    (overwrite :initarg :overwrite :accessor overwrite)
    ))
 
-(defclass analysis ()
+(defclass filtering ()
   ((name :initarg :name :accessor name)
    (file-names :initarg :file-names :accessor file-names)
    (sequences :initform (make-hash-table :test 'equal) :initarg :sequences :accessor sequences)
@@ -27,12 +27,13 @@
    (total-sequence-count :initform 0 :initarg :total-sequence-count :accessor total-sequence-count)
    (good-sequence-count :initform 0 :initarg :good-sequence-count :accessor good-sequence-count)))
 
-(defmethod summarize (analysis)
-  (format t "Files:~%~s~%" (file-names analysis))
-  (format t "Total sequences: ~a~%" (total-sequence-count analysis))
-  (format t "Good sequences:  ~a~%" (good-sequence-count analysis))
+(defmethod summarize (filtering)
+  (format t "Files:~%~s~%" (file-names filtering))
+  (format t "Total sequences: ~a~%" (total-sequence-count filtering))
+  (format t "Good sequences:  ~a~%" (good-sequence-count filtering))
   (format t "Sample sequences:~%")
-  (show-hash-table (sequences analysis)))
+  (show-hash-table (sequences filtering))
+  (values))
 
 (defclass all-codes ()
   ((column-codes :initarg :column-codes :accessor column-codes)
@@ -116,7 +117,6 @@
                                              :sequence overhang-code
                                              :del-name (calculate-del-name digit1 digit2 digit34)
                                              :del-index (1- digit34)))))
-    (format t "~a ~a~%" left-pos right-pos)
     (make-instance 'column-codes
                    :codes codes
                    :start left-pos
@@ -136,10 +136,10 @@
                ((eq cmd :2xyy) (setf r2xseqs (read fin)))
                ((eq cmd :eof) (return-from reader nil))))
     (close fin)
-    (let ((*print-pretty* t))
-      (format t "1x sequences hamming distances~%~a~%" (hamming-matrix r1xseqs))
-      (format t "2x sequences hamming distances~%~a~%" (hamming-matrix r2xseqs)))
-    (format t "Codon offsets~%")
+    (princ (with-output-to-string (sout)
+             (let ((*print-pretty* t))
+               (format sout "1x sequences hamming distances~%~s~%" (hamming-matrix r1xseqs))
+               (format sout "2x sequences hamming distances~%~a~%" (hamming-matrix r2xseqs)))))
     (let ((column-codes (loop for cur = overhangs then (cdr cur)
                               for pair-index in '(0 0 1 1 2 2 3 3 4 4 )
                               for sub-pair-index in '(0 1 0 1 0 1 0 1 0 1)
@@ -155,6 +155,7 @@
                                                               right-overhang
                                                               pair-index
                                                               sub-pair-index))))
+      (format t "Codon offsets: ~{~a ~}~%" (mapcar (lambda (cd) (format nil "~a...~a" (start cd) (end cd))) column-codes))
       (setf *all-codes* (make-instance 'all-codes
                                        :forward-primer (sa:make-string :dna5q-string forward-primer)
                                        :column-codes column-codes
@@ -250,7 +251,7 @@
         result))))
 
 
-(defvar *analysis* (make-hash-table :test 'equal))
+(defvar *filtering* (make-hash-table :test 'equal))
 (defvar *bead-specific (make-hash-table :test 'equal))
 
 
@@ -260,7 +261,7 @@
        (every (lambda (x) (< (low-quality-count x) *low-quality-max*)) result)))
 
   
-(defun analyze-seq-file (analysis file-name seq-file count total-count local-file-count progress-callback pass-file fail-file &key verbose)
+(defun analyze-seq-file (filtering file-name seq-file count total-count local-file-count progress-callback pass-file fail-file &key verbose)
   (let ((title (sa:make-string :char-string))
         (seq (sa:make-string :dna5q-string))
         (align (sa:make-align :dna5q-string))
@@ -269,7 +270,7 @@
                                   (+ count 10000))))
     (labels ((update-progress (count progress)
                (let* ((current-time (get-internal-real-time))
-                      (elapsed-seconds (float (/ (- current-time (start-time analysis)) internal-time-units-per-second)))
+                      (elapsed-seconds (float (/ (- current-time (start-time filtering)) internal-time-units-per-second)))
                       (remaining-seconds (- (* (/ total-count count) elapsed-seconds) elapsed-seconds))
                       (remaining-minutes (/ remaining-seconds 60.0))
                       (remaining-hours (/ remaining-minutes 60.0)))
@@ -277,9 +278,9 @@
                      (floor remaining-hours)
                    (let ((msg (format nil "Read ~a of ~a~%Good sequences ~a (~4,2f\%)~%Remaining remaining time: ~a hours ~4,2f minutes~%~a~%"
                                       count total-count
-                                      (good-sequence-count analysis)
+                                      (good-sequence-count filtering)
                                       (if (> count 0)
-                                          (* 100.0 (/ (good-sequence-count analysis) count))
+                                          (* 100.0 (/ (good-sequence-count filtering) count))
                                           0.0)
                                       hours
                                       (* 60.0 minutes)
@@ -305,20 +306,20 @@
             do (incf count)
             if (accept-result res)
               do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
-                   (incf (good-sequence-count analysis))
-                   (incf (gethash key (sequences analysis) 0))
+                   (incf (good-sequence-count filtering))
+                   (incf (gethash key (sequences filtering) 0))
                    (when pass-file (sa:write-record pass-file title seq)))
             else
               do (when fail-file (sa:write-record fail-file title seq))
             finally (return-from read-loop count)))))
 
-(defun analyze (analysis seq-file-path count total-count local-file-count progress-callback pass-file fail-file &key verbose)
+(defun analyze (filtering seq-file-path count total-count local-file-count progress-callback pass-file fail-file &key verbose)
   (unless (probe-file seq-file-path)
     (error "Could not find file ~a" seq-file-path))
   (let ((seq-file (sa:make-seq-file-in seq-file-path)))
     (unwind-protect
          (progn
-           (setf count (analyze-seq-file analysis seq-file-path seq-file count total-count local-file-count
+           (setf count (analyze-seq-file filtering seq-file-path seq-file count total-count local-file-count
                                         progress-callback pass-file fail-file :verbose verbose))
            (unless count
              (error "Count needs to be an integer")))
@@ -326,8 +327,8 @@
   count)
 
 (defun serial-analyze (parser &key progress-callback)
-  "Read sequences and generate an analysis"
-  (let* ((analysis (make-instance 'analysis
+  "Read sequences and generate an filtering"
+  (let* ((filtering (make-instance 'filtering
                                   :name (name parser)
                                   :start-time (get-internal-real-time) 
                                   :file-names (files parser)))
@@ -343,14 +344,14 @@
              (loop for file in (files parser)
                    for local-file-count in (num-sequences-per-file parser)
                    do (progn
-                        (setf count (analyze analysis file count total-count local-file-count progress-callback pass-file fail-file))
+                        (setf count (analyze filtering file count total-count local-file-count progress-callback pass-file fail-file))
                         (unless (integerp count)
                           (error "count is not an integer"))))))
       (sa:close pass-file)
       (sa:close fail-file))
-    (save-results analysis (output-file-name parser) :overwrite (overwrite parser))
+    (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))
     (funcall progress-callback nil nil :wrote-results-to (output-file-name parser))
-    (format t "Finished analysis.~%")))
+    (format t "Finished filtering.~%")))
   
 (defun save-csv (vals file)
   (with-open-file (fout file :direction :output)
@@ -359,12 +360,12 @@
                (format fout "~{ ~s~^,~}," (car row)))
           do (format fout "~{ ~s~^,~}~%" (cdr row)))))
 
-(defun sequence-survey (seq analysis)
+(defun sequence-survey (seq filtering)
   (let ((ht (make-hash-table :test 'equal)))
     (maphash (lambda (k v)
                (let ((seq-key (subseq k 1 4)))
                  (push (cons k v) (gethash seq-key ht))))
-             analysis)
+             filtering)
     (gethash seq ht)))
 
 (defun show-hash-table (result &optional (max-show 16))
@@ -389,65 +390,62 @@
     (show-hash-table result max-show)
     result))
 
-(defun library-codes (sequences)
+(defun search-library-codes (sequences)
   "Gather up all of the unique library codes and count how many times they appear"
   (let ((library-codes (make-hash-table :test 'equal)))
     (maphash (lambda (key value)
                (let ((library-code (subseq key 4 5)))
-                 (incf (gethash library-code library-codes 0) value)))
+                 (incf (gethash (first library-code) library-codes 0) value)))
              sequences)
-    (maphash (lambda (key value)
-               (format t "~s ~a~%" key value))
-             library-codes)
-    nil))
+    library-codes))
 
-(defun bead-codes (analysis)
+(defun bead-codes (filtering)
   "Gather the sequences and count how many times they appear with different bead codes"
   (let ((bead-codes (make-hash-table :test 'equal)))
     (maphash (lambda (key value)
                (let ((library-code (subseq key 0 2)))
                  (incf (gethash library-code bead-codes 0) value)))
-             (sequences analysis))
+             (sequences filtering))
     bead-codes))
     
-(defun save-results (analysis file &key overwrite)
+(defun save-filtering (filtering file &key overwrite)
   "Save the results to a file. Pass :force t if you want to force overwriting an existing file"
   (when (and (not overwrite) (probe-file file))
     (error "The file ~a already exists~%" file))
   (with-open-file (fout file :direction :output :if-exists (if overwrite :supersede))
     (let ((*print-readably* t)
           (*print-pretty* nil))
-      (prin1 (name analysis) fout)
+      (prin1 (name filtering) fout)
       (terpri fout)
-      (prin1 (file-names analysis) fout)
+      (prin1 (file-names filtering) fout)
       (terpri fout)
-      (prin1 (total-sequence-count analysis) fout)
+      (prin1 (total-sequence-count filtering) fout)
       (terpri fout)
-      (prin1 (good-sequence-count analysis) fout)
+      (prin1 (good-sequence-count filtering) fout)
       (terpri fout)
-      (prin1 (hash-table-count (sequences analysis)) fout)
+      (prin1 (hash-table-count (sequences filtering)) fout)
       (terpri fout)
       (maphash (lambda (k v)
                  (format fout "~s ~s~%" k v))
-               (sequences analysis))))
+               (sequences filtering))))
   (format t "Saved to ~a~%" file))
 
-(defun load-results (file)
+(defun load-filtering (file)
   (with-open-file (fin (merge-pathnames file) :direction :input)
-    (let ((analysis (make-instance 'analysis)))
-      (setf (name analysis) (read fin))
-      (setf (file-names analysis) (read fin))
-      (setf (total-sequence-count analysis) (read fin))
-      (setf (good-sequence-count analysis) (read fin))
+    (let ((filtering (make-instance 'filtering)))
+      (setf (name filtering) (read fin))
+      (setf (file-names filtering) (read fin))
+      (setf (total-sequence-count filtering) (read fin))
+      (setf (good-sequence-count filtering) (read fin))
       (let* ((num-pairs (read fin)))
         (loop for index below num-pairs
               for key = (read fin)
               for val = (read fin)
-              do (setf (gethash key (sequences analysis)) val)))
-      analysis)))
+              do (setf (gethash key (sequences filtering)) val)))
+      filtering)))
 
 (defun join-codons (input)
-  (let ((analysis (make-hash-table :test 'equal)))
+  (let ((filtering (make-hash-table :test 'equal)))
     (maphash (lambda (key val)
                (let* ((sequence-key (subseq key 0 10))
                       (compact-sequence-key (loop for cur = sequence-key then (cddr cur)
@@ -458,9 +456,9 @@
                                                   when cur
                                                     collect (join-del-codes msd lsd) into digits
                                                   )))
-                 (setf (gethash compact-sequence-key analysis) val)))
+                 (setf (gethash compact-sequence-key filtering) val)))
              input)
-    analysis))
+    filtering))
 
 (defun sequence-counts (input)
   (let ((counts nil))
@@ -481,23 +479,58 @@
              input)
     result-sequences))
 
-(defun bead-specific-counts (input-analysis &optional (key-positions '(1 2 3)))
-  (let ((analysis (make-hash-table :test 'equal)))
+(defun bead-specific-counts (input-filtering &key (key-positions '(1 2 3)) library-code)
+  (let ((filtering (make-hash-table :test 'equal)))
     (maphash (lambda (key val)
                (declare (ignore val))
-               (let ((sequence-key (loop for pos in key-positions
+               (let ((library-key (elt key 4))
+                     (sequence-key (loop for pos in key-positions
                                          collect (elt key pos)))) 
-                 (incf (gethash sequence-key analysis 0))))
-             input-analysis)
+                 (if library-code
+                     (when (string= library-code library-key)
+                       (incf (gethash sequence-key filtering 0)))
+                     (incf (gethash sequence-key filtering 0)))))
+             input-filtering)
+    filtering))
+
+(defclass analysis (filtering)
+  ((joined-sequences :initarg :jointed-sequences :accessor joined-sequences)
+   (minimum-counts :initform *minimum-counts* :accessor minimum-counts)
+   (filtered-sequences :accessor filtered-sequences)
+   (library-code :initform *library-code* :accessor library-code)
+   (keys :initarg :keys :accessor keys)
+   (redundancy :accessor redundancy)
+   ))
+
+(defun process-results (file &key (keys '(1 2 3)))
+  (let* ((analysis (load-filtering file)))
+    (change-class analysis 'analysis :keys keys)
+    (setf (joined-sequences analysis) (join-codons (sequences analysis)))
+    (setf (filtered-sequences analysis) (filter-sequences (joined-sequences analysis) (minimum-counts analysis)))
+    (setf (redundancy analysis) (bead-specific-counts (filtered-sequences analysis)
+                                                      :key-positions keys
+                                                      :library-code (library-code analysis)))
     analysis))
 
-(defun merge-hits (in1 in2)
-  "Merge hits from two sorts using their sequences"
+
+(defun filtered-library-codes (analysis)
+  (let ((lib-codes (search-library-codes (filtered-sequences analysis))))
+    (maphash (lambda (k v)
+               (format t "~s ~a~%" k v))
+             lib-codes))
+  (values))
+
+
+
+(defun compare (in1 in2 &key (minimum-redundancy 1))
+  "Compare hits from two sorts using their sequences"
   (let ((results nil))
     (maphash (lambda (k1 v1)
-               (let ((v2 (gethash k1 in2 0)))
-                 (push (list k1 v1 v2) results)))
-             in1)
+               (when (>= v1 minimum-redundancy)
+                 (let ((v2 (gethash k1 (redundancy in2) 0)))
+                   (when (> v2 minimum-redundancy)
+                     (push (list k1 v1 v2) results)))))
+             (redundancy in1))
     (sort results (lambda (x y)
                     (if (> (second x) (second y))
                         t
@@ -505,11 +538,11 @@
                             (> (third x) (third y))))))))
 
 (defvar *hits* nil)
-(defun sort-hits (&optional analysis)
+(defun sort-hits (&optional filtering)
   (let ((unsorted))
     (maphash (lambda (key value)
                (push (cons key value) unsorted))
-             analysis)
+             filtering)
     (setf *hits* (sort unsorted #'> :key #'cdr))
     *hits*))
 
@@ -524,3 +557,6 @@ min  - The minimum number of redundancies."
         when (and (>= red1 min)
                   (>= red2 min))
           collect row))
+
+
+         

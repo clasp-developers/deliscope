@@ -24,5 +24,11 @@
    #:load-results
    #:multiple-redundant
    #:merge-hits
+
+
+
+   #:compare
+   #:filtered-library-codes
+   #:summarize
    ))
    
