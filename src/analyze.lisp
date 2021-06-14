@@ -138,8 +138,8 @@
     (close fin)
     (princ (with-output-to-string (sout)
              (let ((*print-pretty* t))
-               (format sout "1x sequences hamming distances~%~s~%" (hamming-matrix r1xseqs))
-               (format sout "2x sequences hamming distances~%~a~%" (hamming-matrix r2xseqs)))))
+               (format sout "---- 1x sequences hamming distances~%~s~%" (hamming-matrix r1xseqs))
+               (format sout "---- 2x sequences hamming distances~%~a~%" (hamming-matrix r2xseqs)))))
     (let ((column-codes (loop for cur = overhangs then (cdr cur)
                               for pair-index in '(0 0 1 1 2 2 3 3 4 4 )
                               for sub-pair-index in '(0 1 0 1 0 1 0 1 0 1)
@@ -155,7 +155,7 @@
                                                               right-overhang
                                                               pair-index
                                                               sub-pair-index))))
-      (format t "Codon offsets: ~{~a ~}~%" (mapcar (lambda (cd) (format nil "~a...~a" (start cd) (end cd))) column-codes))
+      (format t "---- Relative codon offsets:~% ~{~a ~}~%" (mapcar (lambda (cd) (format nil "~a...~a" (start cd) (end cd))) column-codes))
       (setf *all-codes* (make-instance 'all-codes
                                        :forward-primer (sa:make-string :dna5q-string forward-primer)
                                        :column-codes column-codes
@@ -353,13 +353,6 @@
     (funcall progress-callback nil nil :wrote-results-to (output-file-name parser))
     (format t "Finished filtering.~%")))
   
-(defun save-csv (vals file)
-  (with-open-file (fout file :direction :output)
-    (loop for row in vals
-          do (let ((*print-base* 16))
-               (format fout "~{ ~s~^,~}," (car row)))
-          do (format fout "~{ ~s~^,~}~%" (cdr row)))))
-
 (defun sequence-survey (seq filtering)
   (let ((ht (make-hash-table :test 'equal)))
     (maphash (lambda (k v)
@@ -522,20 +515,31 @@
 
 
 
-(defun compare (in1 in2 &key (minimum-redundancy 1))
+(defun compare-list (minimum-redundancy in1 &optional in2)
   "Compare hits from two sorts using their sequences"
   (let ((results nil))
     (maphash (lambda (k1 v1)
                (when (>= v1 minimum-redundancy)
-                 (let ((v2 (gethash k1 (redundancy in2) 0)))
-                   (when (> v2 minimum-redundancy)
-                     (push (list k1 v1 v2) results)))))
+                 (if in2
+                     (let ((v2 (gethash k1 (redundancy in2) 0)))
+                       (when (> v2 minimum-redundancy)
+                         (push (list k1 v1 v2) results)))
+                     (push (list k1 v1) results))))
              (redundancy in1))
-    (sort results (lambda (x y)
-                    (if (> (second x) (second y))
-                        t
-                        (if (= (second x) (second y))
-                            (> (third x) (third y))))))))
+    (if in2
+        (sort results (lambda (x y)
+                        (if (> (second x) (second y))
+                            t
+                            (if (= (second x) (second y))
+                                (> (third x) (third y))))))
+        (sort results (lambda (x y)
+                        (> (second x) (second y)))))))
+
+(defun compare (in1 in2 &key (minimum-redundancy 1))
+  (compare-list minimum-redundancy in1 in2))
+
+(defun redundancies (in1 &key (minimum-redundancy 1))
+  (compare-list minimum-redundancy in1))
 
 (defvar *hits* nil)
 (defun sort-hits (&optional filtering)
@@ -545,6 +549,21 @@
              filtering)
     (setf *hits* (sort unsorted #'> :key #'cdr))
     *hits*))
+
+(defun save-csv (file analysis1 &optional analysis2)
+  (with-open-file (fout file :direction :output)
+    (format fout "~{ ~a~^,~}~%" (list* "Pos1" "Pos2" "Pos3"
+                                       (format nil "~a" (name analysis1))
+                                       (if analysis2
+                                           (list (format nil "~a" (name analysis2)))
+                                           nil)))
+    (let ((rows (compare-list 0 analysis1 analysis2)))
+      (loop for row in rows
+            do (format fout "~{ ~a~^,~}," (car row))
+            do (format fout "~{ ~a~^,~}~%" (cdr row)))))
+  (format t "Wrote to ~a~%" file)
+  (values))
+
 
 (defun multiple-redundant (hits &key (min 2))
   "Return sequences that are multiply redundant.

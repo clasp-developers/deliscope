@@ -4,5 +4,7 @@
 (format t "deliscope asd path: ~s~%" (merge-pathnames #P"deliscope.asd" (truename *load-pathname*)))
 (ql:quickload :delta-vega)
 (asdf:load-asd (merge-pathnames #P"deliscope.asd" (truename *load-pathname*)))
-(asdf:load-system :deliscope)
+(ql:quickload :deliscope :verbose nil)
 (use-package :ds)
+(format t "Done setup~%")
+
