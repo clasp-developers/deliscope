@@ -65,8 +65,7 @@
   (print-unreadable-object (object stream :type t)
     (format stream "~a ~a ~a ~s"
             (score object)
-            (let ((*print-base* 16))
-              (format nil "~a" (del-name (row-code object))))
+            (row-code object)
             (low-quality-count object)
             (quality-string object))))
 
@@ -170,6 +169,7 @@
   (setf *minimum-counts* minimum-counts))
 
 (defun analyze-column-using-align (align sequence column-codes start adjust low-quality-count quality-string &key verbose)
+  (declare (notinline make-instance))
   (let* ((abs-start (+ start (start column-codes) adjust))
          (unsorted (loop for row-code in (codes column-codes)
                          for name = (del-name row-code)
@@ -260,99 +260,184 @@
        (every (lambda (x) (>= (score x) -2)) result)
        (every (lambda (x) (< (low-quality-count x) *low-quality-max*)) result)))
 
-  
-(defun analyze-seq-file (filtering file-name seq-file count total-count local-file-count progress-callback pass-file fail-file &key verbose)
-  (let ((title (sa:make-string :char-string))
-        (seq (sa:make-string :dna5q-string))
-        (align (sa:make-align :dna5q-string))
-        (next-progress-update (if (> (+ count 10000) total-count)
-                                  total-count
-                                  (+ count 10000))))
-    (labels ((update-progress (count progress)
-               (let* ((current-time (get-internal-real-time))
-                      (elapsed-seconds (float (/ (- current-time (start-time filtering)) internal-time-units-per-second)))
-                      (remaining-seconds (- (* (/ total-count count) elapsed-seconds) elapsed-seconds))
-                      (remaining-minutes (/ remaining-seconds 60.0))
-                      (remaining-hours (/ remaining-minutes 60.0)))
-                 (multiple-value-bind (hours minutes)
-                     (floor remaining-hours)
-                   (let ((msg (format nil "Read ~a of ~a~%Good sequences ~a (~4,2f\%)~%Remaining remaining time: ~a hours ~4,2f minutes~%~a~%"
-                                      count total-count
-                                      (good-sequence-count filtering)
-                                      (if (> count 0)
-                                          (* 100.0 (/ (good-sequence-count filtering) count))
-                                          0.0)
-                                      hours
-                                      (* 60.0 minutes)
-                                      (namestring file-name))))
-                     (mp:check-pending-interrupts)
-                     (incf next-progress-update 10000)
-                     (when (> next-progress-update total-count)
-                       (setf next-progress-update total-count))
-                     (funcall progress-callback progress msg))))))
-      (loop named read-loop
-            for index from 0
-            for res = (progn
-                        (when (sa:at-end seq-file)
-                          (update-progress count progress)
-                          (return-from read-loop count))
-                        (sa:read-record title seq seq-file)
-                        (analyze-sequence align seq :verbose verbose))
-            for progress = (floor (* 100.0 (/ count total-count)))
-            when (>= count next-progress-update)
-              do (update-progress count progress)
-            unless (< index local-file-count)
-              do (return-from read-loop count)
-            do (incf count)
-            if (accept-result res)
-              do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
-                   (incf (good-sequence-count filtering))
-                   (incf (gethash key (sequences filtering) 0))
-                   (when pass-file (sa:write-record pass-file title seq)))
-            else
-              do (when fail-file (sa:write-record fail-file title seq))
-            finally (return-from read-loop count)))))
 
-(defun analyze (filtering seq-file-path count total-count local-file-count progress-callback pass-file fail-file &key verbose)
-  (unless (probe-file seq-file-path)
-    (error "Could not find file ~a" seq-file-path))
-  (let ((seq-file (sa:make-seq-file-in seq-file-path)))
+(defun update-progress (start-time count total-count &optional good-sequence-count)
+  (let* ((current-time (get-internal-real-time))
+         (elapsed-seconds (float (/ (- current-time start-time) internal-time-units-per-second)))
+         (remaining-seconds (if (= count 0) 9999999.0 (- (* (/ total-count count) elapsed-seconds) elapsed-seconds)))
+         (remaining-minutes (/ remaining-seconds 60.0))
+         (remaining-hours (/ remaining-minutes 60.0)))
+    (multiple-value-bind (hours minutes)
+        (if (< remaining-hours 0.0)
+            (values 0 0)
+            (floor remaining-hours))
+      (let ((msg (format nil "Read ~a of ~a~%Remaining time: ~a hour~:p ~4,1f minute~:p~%"
+                         count total-count
+                         hours
+                         (* 60.0 minutes)))
+            (progress (floor (float (* 100.0 (/ count total-count))))))
+        (values progress msg)))))
+
+(defparameter *align-lock* (bt:make-lock 'align-lock))
+(defun thread-safe-make-align (type)
+  (unwind-protect
+       (progn
+         (bt:acquire-lock *align-lock*)
+         (sa:make-align type))
+    (bt:release-lock *align-lock*)))
+
+(defparameter *string-lock* (bt:make-lock 'string-lock))
+(defun thread-safe-make-string (type)
+  (unwind-protect
+       (progn
+         (bt:acquire-lock *string-lock*)
+         (sa:make-string type))
+    (bt:release-lock *string-lock*)))
+
+(defun analyze-one-file (file-index file-name local-file-count &key progress-callback pass-fail-files verbose)
+  (let ((sequences (make-hash-table :test 'equal))
+        (seq-file (sa:make-seq-file-in file-name))
+        (pass-file nil)
+        (fail-file nil)
+        (count 0)
+        (good-sequence-count 0))
+    (when pass-fail-files
+      (let* ((pass-file-name (make-pathname
+                              :name (format nil "~a-pass" (pathname-name (pathname file-name)))
+                              :type "fastq" :defaults (pathname file-name)))
+             (fail-file-name (make-pathname
+                              :name (format nil "~a-fail" (pathname-name (pathname file-name)))
+                              :type "fastq" :defaults (pathname file-name))))
+        (setf pass-file (sa:make-seq-file-out (namestring pass-file-name))
+              fail-file (sa:make-seq-file-out (namestring fail-file-name)))))
     (unwind-protect
-         (progn
-           (setf count (analyze-seq-file filtering seq-file-path seq-file count total-count local-file-count
-                                        progress-callback pass-file fail-file :verbose verbose))
-           (unless count
-             (error "Count needs to be an integer")))
-      (sa:close seq-file)))
-  count)
+         (let ((title (thread-safe-make-string :char-string))
+               (seq (thread-safe-make-string :dna5q-string))
+               (align (thread-safe-make-align :dna5q-string))
+               (next-progress-update (if (> (+ count 10000) local-file-count)
+                                         local-file-count
+                                         (+ count 10000))))
+           (loop named read-loop
+                 for index from 0
+                 for res = (progn
+                             (when (sa:at-end seq-file)
+                               (return-from read-loop count))
+                             (sa:read-record title seq seq-file)
+                             (analyze-sequence align seq :verbose verbose))
+                 when (>= count next-progress-update)
+                   do (progn
+                        (incf next-progress-update 10000)
+                        (when (> next-progress-update local-file-count)
+                          (setf next-progress-update local-file-count))
+                        (when progress-callback
+                          (funcall progress-callback file-index count)))
+                 do (incf count)
+                 unless (< index local-file-count)
+                   do (return-from read-loop count)
+                 if (accept-result res)
+                   do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
+                        (incf good-sequence-count)
+                        (incf (gethash key sequences 0))
+                        (when pass-file (sa:write-record pass-file title seq)))
+                 else
+                   do (when fail-file (sa:write-record fail-file title seq))
+                 finally (return-from read-loop count)))
+      (progn
+        (sa:close seq-file)
+        (when pass-file (sa:close pass-file))
+        (when fail-file (sa:close fail-file))))
+    sequences))
 
 (defun serial-analyze (parser &key progress-callback)
   "Read sequences and generate an filtering"
-  (let* ((filtering (make-instance 'filtering
-                                  :name (name parser)
-                                  :start-time (get-internal-real-time) 
-                                  :file-names (files parser)))
-         (pass-file (sa:make-seq-file-out (namestring (pass-file-name parser))))
-         (fail-file (sa:make-seq-file-out (namestring (fail-file-name parser)))))
-    (unwind-protect
-         (progn
-           (loop for file in (files parser)
-                 do (unless (probe-file file)
-                      (error "Could not find file: ~a~%" file)))
-           (let ((total-count (apply '+ (num-sequences-per-file parser)))
-                 (count 0))
-             (loop for file in (files parser)
-                   for local-file-count in (num-sequences-per-file parser)
-                   do (progn
-                        (setf count (analyze filtering file count total-count local-file-count progress-callback pass-file fail-file))
-                        (unless (integerp count)
-                          (error "count is not an integer"))))))
-      (sa:close pass-file)
-      (sa:close fail-file))
+  (let* ((start-time (get-internal-real-time))
+         (filtering (make-instance 'filtering
+                                   :name (name parser)
+                                   :start-time start-time
+                                   :file-names (files parser))))
+    (loop for file in (files parser)
+          do (unless (probe-file file)
+               (error "Could not find file: ~a~%" file)))
+    (let ((total-count (apply '+ (num-sequences-per-file parser)))
+          (counters (make-array (length (files parser)) :initial-element 0 )))
+      (loop for file in (files parser)
+            for file-index from 0
+            for local-file-count in (num-sequences-per-file parser)
+            for one-file-ht = (analyze-one-file file-index file local-file-count
+                                                :progress-callback
+                                                (lambda (file-index count)
+                                                  (setf (elt counters file-index) count)
+                                                  (when progress-callback
+                                                    (let ((sum-count (loop for x across counters
+                                                                           sum x)))
+                                                      (multiple-value-bind (progress msg)
+                                                          (update-progress start-time sum-count total-count)
+                                                        (funcall progress-callback progress msg)))))
+                                                :pass-fail-files t)
+            do (maphash (lambda (seq counts)
+                          (incf (gethash seq (sequences filtering) 0) counts))
+                        one-file-ht)))
+    (format t "About to save results~%")
     (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))
-    (funcall progress-callback nil nil :wrote-results-to (output-file-name parser))
+    (when progress-callback (funcall progress-callback 100 nil :done t))
     (format t "Finished filtering.~%")))
-  
+
+
+(defparameter *progress-callback* nil)
+(defparameter *file-index* nil)
+(defparameter *file* nil)
+(defparameter *num-sequences* nil)
+(defparameter *counters* nil)
+(defparameter *results* nil)
+
+(defun parallel-analyze (parser &key progress-callback)
+  "Read sequences and generate an filtering"
+  (let* ((start-time (get-internal-real-time))
+         (filtering (make-instance 'filtering
+                                   :name (name parser)
+                                   :start-time start-time
+                                   :file-names (files parser))))
+    (loop for file in (files parser)
+          do (unless (probe-file file)
+               (error "Could not find file: ~a~%" file)))
+    (let* ((counters (make-array (length (files parser)) :initial-element 0 ))
+           (results (make-array (length (files parser))))
+           (sum-total (apply #'+ (num-sequences-per-file parser)))
+           (workers (loop for file-index below (length (files parser))
+                          for file in (files parser)
+                          for num-sequences-in-file in (num-sequences-per-file parser)
+                          collect (bt:make-thread
+                                   (lambda ()
+                                     (let ((ht (analyze-one-file *file-index* *file* *num-sequences*
+                                                                 :progress-callback (lambda (file-index count)
+                                                                                      (setf (elt *counters* file-index) count)))))
+                                       (setf (elt *results* *file-index*) ht)))
+                                   :initial-bindings (list (cons '*file-index* file-index)
+                                                           (cons '*file* file)
+                                                           (cons '*num-sequences* num-sequences-in-file)
+                                                           (cons '*counters* counters)
+                                                           (cons '*results* results))))))
+      (loop named monitor
+            do (sleep 1)
+               (core:check-pending-interrupts)
+               (let ((sum-count (loop for num below (length counters)
+                                      for count = (elt counters num)
+                                      sum count)))
+                 (when progress-callback
+                   (multiple-value-bind (progress msg)
+                       (update-progress start-time sum-count sum-total)
+                     (funcall progress-callback progress msg))))
+               (when (every (lambda (x) (not (bt:thread-alive-p x))) workers)
+                 (return-from monitor nil)))
+      (loop for result across results
+            do (maphash (lambda (seq counts)
+                          (incf (gethash seq (sequences filtering) 0) counts))
+                        result))
+      (format t "About to save results~%")
+      (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))
+      (when progress-callback (funcall progress-callback 100 nil :done t))
+      (format t "Finished filtering.~%"))))
+
 (defun sequence-survey (seq filtering)
   (let ((ht (make-hash-table :test 'equal)))
     (maphash (lambda (k v)
@@ -576,6 +661,3 @@ min  - The minimum number of redundancies."
         when (and (>= red1 min)
                   (>= red2 min))
           collect row))
-
-
-         

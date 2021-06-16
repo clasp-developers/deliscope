@@ -12,7 +12,7 @@
     (error "Could not find file: ~a" file-name))
   (if num
       num
-      (let ((num-lines (core:count-lines-in-file file-name)))
+      (let ((num-lines (core:count-lines-in-file file-name 0 2)))
         (/ num-lines 4))))
   
 (defun create-sequence-parser (name files &key num pass-file-name fail-file-name output-file-name (overwrite t))
@@ -32,8 +32,8 @@
   (format t "This may take a few minutes - hit ii to interrupt.~%")
   (finish-output)
   (let* ((num-seq-per-file (lparallel:pmapcar (lambda (file)
-                                                (count-sequences-in-file file :num num :verbose nil))
-                                              files))
+                                     (count-sequences-in-file file :num num :verbose nil))
+                                   files))
          (parser (make-instance 'parser :name name
                                         :files files
                                         :num-sequences-per-file num-seq-per-file
@@ -54,38 +54,46 @@
    (messages :initarg :messages :reader messages)
    (holder :initarg :holder :accessor holder)))
 
-(defun parse (parser)
-  (let* ((stop-button (jw:make-button :description "Stop"))
-         (progress-bar (jw:make-int-progress))
-         (messages (jw:make-text-area :rows 2 :layout (jw:make-layout :width "300pt"
-                                                                      :height "70pt")))
-         (holder (jw:make-v-box :children (list progress-bar
-                                                messages
-                                                stop-button)))
-         (progress (make-instance 'progress :progress-bar progress-bar
-                                            :messages messages
-                                            :holder holder)))
-    (let ((thread (bordeaux-threads:make-thread
-                   (lambda ()
-                     (serial-analyze *parser*
-                                     :progress-callback (lambda (progress msg &key wrote-results-to)
-                                                          (if wrote-results-to
-                                                              (setf (jw:widget-value (messages *progress*))
-                                                                    (format nil "~aWrote results to: ~a~%" (jw:widget-value (messages *progress*))
-                                                                            wrote-results-to))
-                                                              (progn
-                                                                (setf (jw:widget-value (progress-bar *progress*)) progress)
-                                                                (setf (jw:widget-value (messages *progress*)) msg))))))
-                   :name (format nil "parse-~a" (name parser))
-                   :initial-bindings (list (cons '*progress* progress)
-                                           (cons '*parser* parser)))))
-      (jw:on-button-click stop-button (lambda (&rest args)
-                                        (declare (ignore args))
-                                        (bordeaux-threads:destroy-thread thread)
-                                        (setf (jw:widget-value messages) "Stopped parsing.")
-                                        )))
-    (holder progress)))
 
+(defun run-impl (serial-parallel parsers)
+  (let* ((container (make-instance 'jw:v-box))
+         (panels (loop for parser in parsers
+                       collect (cw:make-threaded-task-page
+                                container
+                                (format nil "Task ~a" (name parser))
+                                (lambda (instance action parser progress-callback)
+                                  (declare (ignore action))
+                                  (funcall serial-parallel
+                                           parser
+                                           :progress-callback (let ((last-val -1))
+                                                                (lambda (val msg &key done)
+                                                                  (if done
+                                                                      (format t "Done.~%")
+                                                                      (progn
+                                                                        (when (> val last-val)
+                                                                          (setf last-val val)
+                                                                          (progn
+                                                                            (format t "Progress: ~a~%" val)
+                                                                            (format t "~a~%" msg)
+                                                                            (finish-output)
+                                                                            (funcall progress-callback :value val :maximum 100))))))))
+                                  t)
+                                :parameter parser
+                                :label "Click button to start."))))
+    (j:display container)
+    (loop for panel in panels
+          do (cw:run-task panel))
+    (values)))
+
+(defun run (&rest parsers)
+  "Parse sequence files one at a time but parsers are run in parallel."
+  (run-impl 'serial-analyze parsers))
+
+(defun run-fast (&rest parsers)
+  "Parse sequence files in parallel and parsers in parallel.
+ This is experimental and depends on the SeqAn 2.0 library to be thread safe,
+ which I am not absolutely certain it is.  If this crashes - use 'run'."
+  (run-impl 'parallel-analyze parsers))
 
 (defun plot-counts (data title)
   (let* ((x-data (coerce (subseq (mapcar #'car data) 0) 'vector))
