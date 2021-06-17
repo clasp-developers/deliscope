@@ -40,6 +40,24 @@
   (show-hash-table (sequences filtering))
   (values))
 
+(defclass job-tracker ()
+  ((sequence-count :initform 0 :accessor sequence-count)
+   (good-sequence-count :initform 0 :accessor good-sequence-count)
+   (seq-file-position :initform 0 :accessor seq-file-position)
+   (seq-file-length :initform 0 :accessor seq-file-length)
+   (result :accessor result)))
+
+(defun sum-trackers (sum-tracker trackers)
+  (loop for index below (length trackers)
+        for tracker = (elt trackers index)
+        sum (sequence-count tracker) into sequence-count-sum
+        sum (good-sequence-count tracker) into good-sequence-count-sum
+        sum (seq-file-position tracker) into seq-file-position-sum
+        finally (setf (sequence-count sum-tracker) sequence-count-sum
+                      (good-sequence-count sum-tracker) good-sequence-count-sum
+                      (seq-file-position sum-tracker) seq-file-position-sum)))
+
+
 (defclass all-codes ()
   ((column-codes :initarg :column-codes :accessor column-codes)
    (forward-primer :initarg :forward-primer :accessor forward-primer)
@@ -190,7 +208,7 @@
                                                           upper-diag ))
           do (when verbose
                (format t "Score: ~a~%" score)
-               (format t "~a~%" (sa:to-string align)))
+               (format t "~a~%" (sa:to-string (align align-view))))
           do (when (> score best-score)
                (setf best-score score
                      best-row-code row-code)))
@@ -263,23 +281,31 @@
        (every (lambda (x) (< (low-quality-count x) *low-quality-max*)) result)))
 
 
-(defun update-progress (start-time count total-count &optional good-sequence-count)
-  (let* ((current-time (get-internal-real-time))
-         (elapsed-seconds (float (/ (- current-time start-time) internal-time-units-per-second)))
-         (remaining-seconds (if (= count 0) 9999999.0 (- (* (/ total-count count) elapsed-seconds) elapsed-seconds)))
-         (remaining-minutes (/ remaining-seconds 60.0))
-         (remaining-hours (/ remaining-minutes 60.0)))
-    (multiple-value-bind (hours minutes)
-        (if (< remaining-hours 0.0)
-            (values 0 0)
-            (floor remaining-hours))
-      (let ((msg (format nil "Read ~a of ~a~%Good sequences: ~a~%Remaining time: ~a hour~:p ~4,1f minute~:p~%"
-                         count total-count
-                         good-sequence-count
-                         hours
-                         (* 60.0 minutes)))
-            (progress (floor (float (* 100.0 (/ count total-count))))))
-        (values progress msg)))))
+(defun evaluate-progress (start-time sum-tracker total-count)
+  (let ((count (sequence-count sum-tracker)))
+    (if (= count 0)
+        (let ((msg (format nil "Read ~a of ~a~%Estimating remaining time...~%" count total-count)))
+          (values 0 msg))
+        (let* ((good-sequence-count (good-sequence-count sum-tracker))
+               (current-time (get-internal-real-time))
+               (elapsed-seconds (float (/ (- current-time start-time) internal-time-units-per-second)))
+               (remaining-seconds (if (= count 0) 9999999.0 (- (* (/ total-count count) elapsed-seconds) elapsed-seconds)))
+               (remaining-minutes (/ remaining-seconds 60.0))
+               (remaining-hours (/ remaining-minutes 60.0)))
+          (multiple-value-bind (hours minutes)
+              (if (< remaining-hours 0.0)
+                  (values 0 0)
+                  (floor remaining-hours))
+            (labels ((time-description (hours minutes)
+                       (if (zerop hours)
+                           (format nil "~4,1f minute~:p" minutes)
+                           (format nil "~a hour~:p ~4,1f minute~:p" hours minutes))))
+              (let ((msg (format nil "Read ~a of ~a~%Good sequences: ~a~%Estimated remaining time: ~a~%"
+                                 count total-count
+                                 good-sequence-count
+                                 (time-description hours (* 60.0 minutes))))
+                    (progress (floor (float (* 100.0 (/ count total-count))))))
+                (values progress msg))))))))
 
 (defparameter *align-lock* (bt:make-lock 'align-lock))
 (defun thread-safe-make-align-view (type)
@@ -341,7 +367,7 @@
                         (when (> next-progress-update local-file-count)
                           (setf next-progress-update local-file-count))
                         (when progress-callback
-                          (funcall progress-callback file-index count good-sequence-count)))
+                          (funcall progress-callback file-index count good-sequence-count 9999)))
                  do (incf count)
                  unless (< index local-file-count)
                    do (return-from read-loop count)
@@ -359,6 +385,13 @@
         (when fail-file (sa:close fail-file))))
     sequences))
 
+
+(defun make-job-tracker-vector (number-of-jobs)
+  (let ((trackers (make-array number-of-jobs)))
+    (loop for index below number-of-jobs
+          do (setf (elt trackers index) (make-instance 'job-tracker)))
+    trackers))
+
 (defun serial-analyze (parser &key progress-callback)
   "Read sequences and generate an filtering"
   (let* ((start-time (get-internal-real-time))
@@ -370,23 +403,25 @@
           do (unless (probe-file file)
                (error "Could not find file: ~a~%" file)))
     (let ((total-count (apply '+ (num-sequences-per-file parser)))
-          (counters (make-array (length (files parser)) :initial-element 0 ))
-          (good-sequence-counters (make-array (length (files parser)) :initial-element 0)))
+          (trackers (make-job-tracker-vector (length (files parser))))
+          (sum-tracker (make-instance 'job-tracker)))
       (loop for file in (files parser)
             for file-index from 0
             for local-file-count in (num-sequences-per-file parser)
-            for one-file-ht = (analyze-one-file file-index file local-file-count
-                                                :progress-callback
-                                                (lambda (file-index count good-sequence-count)
-                                                  (setf (elt counters file-index) count)
-                                                  (setf (elt good-sequence-counters file-index) good-sequence-count)
-                                                  (when progress-callback
-                                                    (let ((sum-count (loop for x across counters sum x))
-                                                          (sum-good-sequence-count (loop for count across good-sequence-counters sum count)))
-                                                      (multiple-value-bind (progress msg)
-                                                          (update-progress start-time sum-count total-count sum-good-sequence-count)
-                                                        (funcall progress-callback progress msg)))))
-                                                :pass-fail-files t)
+            for one-file-ht = (analyze-one-file
+                               file-index file local-file-count
+                               :progress-callback
+                               (lambda (file-index count good-sequence-count seq-file-position)
+                                 (let ((tracker (elt trackers file-index)))
+                                   (setf (sequence-count tracker) count
+                                         (good-sequence-count tracker) good-sequence-count
+                                         (seq-file-position tracker) seq-file-position)
+                                   (when progress-callback
+                                     (sum-trackers sum-tracker trackers)
+                                     (multiple-value-bind (progress msg)
+                                         (evaluate-progress start-time sum-tracker total-count)
+                                       (funcall progress-callback progress msg)))))
+                               :pass-fail-files t)
             do (maphash (lambda (seq counts)
                           (incf (gethash seq (sequences filtering) 0) counts))
                         one-file-ht)))
@@ -400,8 +435,7 @@
 (defparameter *file-index* nil)
 (defparameter *file* nil)
 (defparameter *num-sequences* nil)
-(defparameter *counters* nil)
-(defparameter *results* nil)
+(defparameter *trackers* nil)
 
 (defun parallel-analyze (parser &key progress-callback)
   "Read sequences and generate an filtering"
@@ -413,45 +447,45 @@
     (loop for file in (files parser)
           do (unless (probe-file file)
                (error "Could not find file: ~a~%" file)))
-    (let* ((counters (make-array (length (files parser)) :initial-element 0 ))
-           (good-sequence-counters (make-array (length (files parser)) :initial-element 0 ))
-           (results (make-array (length (files parser))))
+    (let* ((trackers (make-job-tracker-vector (length (files parser))))
            (sum-total (apply #'+ (num-sequences-per-file parser)))
            (workers (loop for file-index below (length (files parser))
                           for file in (files parser)
                           for num-sequences-in-file in (num-sequences-per-file parser)
                           collect (bt:make-thread
                                    (lambda ()
-                                     (let ((ht (analyze-one-file *file-index* *file* *num-sequences*
-                                                                 :progress-callback (lambda (file-index count good-sequence-count)
-                                                                                      (setf (elt *counters* file-index) count)
-                                                                                      (setf (elt *good-sequence-counters* file-index) good-sequence-count)))))
-                                       (setf (elt *results* *file-index*) ht)))
+                                     (let ((ht (analyze-one-file
+                                                *file-index* *file* *num-sequences*
+                                                :progress-callback (lambda (file-index count good-sequence-count seq-file-position)
+                                                                     (let ((tracker (elt *trackers* file-index)))
+                                                                       (setf (sequence-count tracker) count
+                                                                             (good-sequence-count tracker) good-sequence-count
+                                                                             (seq-file-position tracker) seq-file-position))))))
+                                       (setf (result (elt *trackers* *file-index*)) ht)))
                                    :initial-bindings (list (cons '*file-index* file-index)
                                                            (cons '*file* file)
                                                            (cons '*num-sequences* num-sequences-in-file)
-                                                           (cons '*counters* counters)
-                                                           (cons '*good-sequence-counters* good-sequence-counters)
-                                                           (cons '*results* results))))))
-      (loop named monitor
-            do (sleep 1)
-               (core:check-pending-interrupts)
-               (let ((sum-count (loop for count across counters sum count))
-                     (sum-good-sequence-count (loop for count across good-sequence-counters sum count)))
+                                                           (cons '*trackers* trackers))))))
+      (let ((sum-tracker (make-instance 'job-tracker)))
+        (loop named monitor
+              do (sleep 1)
+                 (core:check-pending-interrupts)
+                 (sum-trackers sum-tracker trackers)
                  (when progress-callback
                    (multiple-value-bind (progress msg)
-                       (update-progress start-time sum-count sum-total sum-good-sequence-count)
-                     (funcall progress-callback progress msg))))
-               (when (every (lambda (x) (not (bt:thread-alive-p x))) workers)
-                 (return-from monitor nil)))
-      (loop for result across results
+                       (evaluate-progress start-time sum-tracker sum-total)
+                     (funcall progress-callback progress msg)))
+                 (when (every (lambda (x) (not (bt:thread-alive-p x))) workers)
+                   (return-from monitor nil))))
+      (loop for tracker across trackers
+            for result = (result tracker)
             do (maphash (lambda (seq counts)
                           (incf (gethash seq (sequences filtering) 0) counts))
                         result))
       (format t "About to save results~%")
       (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))
       (when progress-callback (funcall progress-callback 100 nil :done t))
-      (format t "Finished filtering.~%"))))
+      (format t "Finished parsing sequences.~%"))))
 
 (defun sequence-survey (seq filtering)
   (let ((ht (make-hash-table :test 'equal)))
@@ -676,3 +710,28 @@ min  - The minimum number of redundancies."
         when (and (>= red1 min)
                   (>= red2 min))
           collect row))
+
+
+#|
+
+Copyright (c) 2021, Christian E. Schafmeister
+
+Deliscope is free software; you can redistribute it and/or
+modify it under the terms of the GNU Library General Public
+License as published by the Free Software Foundation; either
+version 2.1 of the License, or (at your option) any later version.
+
+See file 'LICENSE' for full details.
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+|#
