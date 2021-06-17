@@ -56,10 +56,10 @@
     (format stream "~a ~a ~a" (del-name object) (del-name object) (sa:to-string (code object)))))
 
 (defclass match ()
-  ((score :initarg :score :accessor score)
-   (low-quality-count :initarg :low-quality-count :accessor low-quality-count)
-   (quality-string :initarg :quality-string :accessor quality-string)
-   (row-code :initarg :row-code :accessor row-code)))
+  ((score :initform nil :initarg :score :accessor score)
+   (low-quality-count :initform nil :initarg :low-quality-count :accessor low-quality-count)
+   (quality-string :initform nil :initarg :quality-string :accessor quality-string)
+   (row-code :initform nil :initarg :row-code :accessor row-code)))
 
 (defmethod print-object ((object match) stream)
   (print-unreadable-object (object stream :type t)
@@ -271,8 +271,9 @@
         (if (< remaining-hours 0.0)
             (values 0 0)
             (floor remaining-hours))
-      (let ((msg (format nil "Read ~a of ~a~%Remaining time: ~a hour~:p ~4,1f minute~:p~%"
+      (let ((msg (format nil "Read ~a of ~a~%Good sequences: ~a~%Remaining time: ~a hour~:p ~4,1f minute~:p~%"
                          count total-count
+                         good-sequence-count
                          hours
                          (* 60.0 minutes)))
             (progress (floor (float (* 100.0 (/ count total-count))))))
@@ -330,7 +331,7 @@
                         (when (> next-progress-update local-file-count)
                           (setf next-progress-update local-file-count))
                         (when progress-callback
-                          (funcall progress-callback file-index count)))
+                          (funcall progress-callback file-index count good-sequence-count)))
                  do (incf count)
                  unless (< index local-file-count)
                    do (return-from read-loop count)
@@ -359,19 +360,21 @@
           do (unless (probe-file file)
                (error "Could not find file: ~a~%" file)))
     (let ((total-count (apply '+ (num-sequences-per-file parser)))
-          (counters (make-array (length (files parser)) :initial-element 0 )))
+          (counters (make-array (length (files parser)) :initial-element 0 ))
+          (good-sequence-counters (make-array (length (files parser)) :initial-element 0)))
       (loop for file in (files parser)
             for file-index from 0
             for local-file-count in (num-sequences-per-file parser)
             for one-file-ht = (analyze-one-file file-index file local-file-count
                                                 :progress-callback
-                                                (lambda (file-index count)
+                                                (lambda (file-index count good-sequence-count)
                                                   (setf (elt counters file-index) count)
+                                                  (setf (elt good-sequence-counters file-index) good-sequence-count)
                                                   (when progress-callback
-                                                    (let ((sum-count (loop for x across counters
-                                                                           sum x)))
+                                                    (let ((sum-count (loop for x across counters sum x))
+                                                          (sum-good-sequence-count (loop for count across good-sequence-counters sum count)))
                                                       (multiple-value-bind (progress msg)
-                                                          (update-progress start-time sum-count total-count)
+                                                          (update-progress start-time sum-count total-count sum-good-sequence-count)
                                                         (funcall progress-callback progress msg)))))
                                                 :pass-fail-files t)
             do (maphash (lambda (seq counts)
@@ -401,6 +404,7 @@
           do (unless (probe-file file)
                (error "Could not find file: ~a~%" file)))
     (let* ((counters (make-array (length (files parser)) :initial-element 0 ))
+           (good-sequence-counters (make-array (length (files parser)) :initial-element 0 ))
            (results (make-array (length (files parser))))
            (sum-total (apply #'+ (num-sequences-per-file parser)))
            (workers (loop for file-index below (length (files parser))
@@ -409,23 +413,24 @@
                           collect (bt:make-thread
                                    (lambda ()
                                      (let ((ht (analyze-one-file *file-index* *file* *num-sequences*
-                                                                 :progress-callback (lambda (file-index count)
-                                                                                      (setf (elt *counters* file-index) count)))))
+                                                                 :progress-callback (lambda (file-index count good-sequence-count)
+                                                                                      (setf (elt *counters* file-index) count)
+                                                                                      (setf (elt *good-sequence-counters* file-index) good-sequence-count)))))
                                        (setf (elt *results* *file-index*) ht)))
                                    :initial-bindings (list (cons '*file-index* file-index)
                                                            (cons '*file* file)
                                                            (cons '*num-sequences* num-sequences-in-file)
                                                            (cons '*counters* counters)
+                                                           (cons '*good-sequence-counters* good-sequence-counters)
                                                            (cons '*results* results))))))
       (loop named monitor
             do (sleep 1)
                (core:check-pending-interrupts)
-               (let ((sum-count (loop for num below (length counters)
-                                      for count = (elt counters num)
-                                      sum count)))
+               (let ((sum-count (loop for count across counters sum count))
+                     (sum-good-sequence-count (loop for count across good-sequence-counters sum count)))
                  (when progress-callback
                    (multiple-value-bind (progress msg)
-                       (update-progress start-time sum-count sum-total)
+                       (update-progress start-time sum-count sum-total sum-good-sequence-count)
                      (funcall progress-callback progress msg))))
                (when (every (lambda (x) (not (bt:thread-alive-p x))) workers)
                  (return-from monitor nil)))

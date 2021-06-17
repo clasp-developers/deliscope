@@ -6,14 +6,16 @@
             :accessor parsers))
   )
 
-(defun count-sequences-in-file (file-name &key num verbose)
+(defun estimate-sequences-in-file (file-name &key num verbose)
   (declare (ignore verbose))
   (unless (probe-file file-name)
     (error "Could not find file: ~a" file-name))
   (if num
       num
-      (let ((num-lines (core:count-lines-in-file file-name 0 2)))
-        (/ num-lines 4))))
+      (multiple-value-bind (num-lines file-pos file-size)
+          (core:count-lines-in-file file-name 1000000)
+          (let ((estimate-lines (floor (* (/ file-size file-pos) num-lines))))
+            (floor (/ estimate-lines 4))))))
   
 (defun create-sequence-parser (name files &key num pass-file-name fail-file-name output-file-name (overwrite t))
   (unless pass-file-name
@@ -32,7 +34,7 @@
   (format t "This may take a few minutes - hit ii to interrupt.~%")
   (finish-output)
   (let* ((num-seq-per-file (lparallel:pmapcar (lambda (file)
-                                     (count-sequences-in-file file :num num :verbose nil))
+                                     (estimate-sequences-in-file file :num num :verbose nil))
                                    files))
          (parser (make-instance 'parser :name name
                                         :files files
