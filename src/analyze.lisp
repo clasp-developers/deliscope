@@ -8,6 +8,11 @@
 (defparameter *low-quality-max* 2)
 (defparameter *minimum-counts* 100)
 
+(defclass align-view ()
+  ((align :initarg :align :accessor align)
+   (row0& :initarg :row0& :reader row0&)
+   (row1& :initarg :row1& :reader row1&)))
+   
 (defclass parser ()
   ((name :initarg :name :accessor name)
    (files :initarg :files :accessor files)
@@ -168,34 +173,32 @@
   (setf *library-code* library-code)
   (setf *minimum-counts* minimum-counts))
 
-(defun analyze-column-using-align (align sequence column-codes start adjust low-quality-count quality-string &key verbose)
-  (declare (notinline make-instance))
+(defun analyze-column-using-align (align-view sequence column-codes start adjust low-quality-count quality-string &key verbose)
   (let* ((abs-start (+ start (start column-codes) adjust))
-         (unsorted (loop for row-code in (codes column-codes)
-                         for name = (del-name row-code)
-                         for code = (code row-code)
-                         for lower-diag = (- abs-start 1)
-                         for upper-diag = (+ lower-diag 1) ;;+ start end-offset )
-                         for score-code = (let (#+(or)(align (sa:make-align :dna5q-string)))
-                                            (sa:resize (sa:rows& align) 2)
-                                            (sa:assign-source (sa:row& align 0) sequence)
-                                            (sa:assign-source (sa:row& align 1) code)
-                                            (let ((score (sa:global-alignment align *simple-score* *align-config*
-                                                                              lower-diag
-                                                                              upper-diag )))
-                                              (when verbose
-                                                (format t "Score: ~a~%" score)
-                                                (format t "~a~%" (sa:to-string align)))
-                                              (make-instance 'match :score score
-                                                                    :low-quality-count low-quality-count
-                                                                    :quality-string quality-string
-                                                                    :row-code row-code)))
-                         collect score-code into uns
-                         if (zerop (score score-code))
-                           do (return uns)
-                         finally (return uns))))
-    (when verbose (format t "unsorted alignments: ~s~%" unsorted))
-    (first (sort unsorted #'> :key #'score))))
+         (best-score -999999)
+         (best-row-code nil))
+    (loop for row-code in (codes column-codes)
+          for name = (del-name row-code)
+          for code = (code row-code)
+          for lower-diag = (- abs-start 1)
+          for upper-diag = (+ lower-diag 1) ;;+ start end-offset )
+          for score = (progn
+                        (sa:assign-source (row0& align-view) sequence)
+                        (sa:assign-source (row1& align-view) code)
+                        (sa:global-alignment (align align-view) *simple-score* *align-config*
+                                                          lower-diag
+                                                          upper-diag ))
+          do (when verbose
+               (format t "Score: ~a~%" score)
+               (format t "~a~%" (sa:to-string align)))
+          do (when (> score best-score)
+               (setf best-score score
+                     best-row-code row-code)))
+    (make-instance 'match
+                   :score best-score
+                   :low-quality-count low-quality-count
+                   :quality-string quality-string
+                   :row-code best-row-code)))
 
 (defun analyze-column-fast (sequence column-codes start adjust &key verbose)
   (let* ((seq-string (sa:to-string sequence))
@@ -208,7 +211,7 @@
             do (return-from analyze-column-fast (values t row-code)))
     (values nil)))
 
-(defun analyze-column (align sequence column-codes start adjust &key verbose)
+(defun analyze-column (align-view sequence column-codes start adjust &key verbose)
   (let* ((abs-start (+ start (start column-codes) adjust))
          (abs-end (+ start (end column-codes) adjust)))
     (multiple-value-bind (low-quality-count qual-string)
@@ -220,30 +223,29 @@
                                                             :low-quality-count low-quality-count
                                                             :row-code row-code
                                                             :quality-string qual-string))))
-      (analyze-column-using-align align sequence column-codes start adjust low-quality-count qual-string :verbose verbose))))
+      (analyze-column-using-align align-view sequence column-codes start adjust low-quality-count qual-string :verbose verbose))))
 
-(defun analyze-forward-primer (align sequence &key verbose)
-  (sa:resize (sa:rows& align) 2)
-  (sa:assign-source (sa:row& align 0) sequence)
-  (sa:assign-source (sa:row& align 1) (forward-primer *all-codes*))
-  (let ((fwd-score (sa:global-alignment align *simple-score* *align-config*))
-        (start (1+ (sa:to-view-position (sa:row& align 1) (sa:length (forward-primer *all-codes*))))))
-    (when verbose (format t "Alignment: ~%~a~%" (sa:to-string align)))
+(defun analyze-forward-primer (align-view sequence &key verbose)
+  (sa:assign-source (row0& align-view) sequence)
+  (sa:assign-source (row1& align-view) (forward-primer *all-codes*))
+  (let ((fwd-score (sa:global-alignment (align align-view) *simple-score* *align-config*))
+        (start (1+ (sa:to-view-position (row1& align-view) (sa:length (forward-primer *all-codes*))))))
+    (when verbose (format t "Alignment: ~%~a~%" (sa:to-string (align align-view))))
     (values start fwd-score)))
 
-(defun analyze-sequence (align sequence &key verbose)
+(defun analyze-sequence (align-view sequence &key verbose)
   (multiple-value-bind (start fwd-score)
-      (analyze-forward-primer align sequence :verbose verbose)
+      (analyze-forward-primer align-view sequence :verbose verbose)
     (declare (ignore fwd-score))
     (when verbose
       (format t "len fwd: ~a~%" (sa:length (forward-primer *all-codes*)))
       (format t "3' end: ~a~%" start)
-      (format t "~a~%" (sa:to-string align)))
+      (format t "~a~%" (sa:to-string (align align-view))))
     (when (> (sa:length sequence) (+ start (end *all-codes*)))
       (let ((result (loop for column-codes in (column-codes *all-codes*)
                           for start-offset = (start column-codes)
                           for end-offset = (end column-codes)
-                          for best-digit = (analyze-column align sequence column-codes start 0 :verbose verbose)
+                          for best-digit = (analyze-column align-view sequence column-codes start 0 :verbose verbose)
                           do (when verbose (format t "offset: ~a best-digits: ~a~%" start-offset best-digit))
                           collect best-digit)))
         (when verbose
@@ -280,11 +282,19 @@
         (values progress msg)))))
 
 (defparameter *align-lock* (bt:make-lock 'align-lock))
-(defun thread-safe-make-align (type)
+(defun thread-safe-make-align-view (type)
   (unwind-protect
        (progn
          (bt:acquire-lock *align-lock*)
-         (sa:make-align type))
+         (let* ((align (sa:make-align type))
+                (rows& (sa:rows& align)))
+           (sa:resize rows& 2)
+           (let ((row0& (sa:row& align 0))
+                 (row1& (sa:row& align 1)))
+             (make-instance 'align-view
+                            :align align
+                            :row0& row0&
+                            :row1& row1&))))
     (bt:release-lock *align-lock*)))
 
 (defparameter *string-lock* (bt:make-lock 'string-lock))
@@ -314,7 +324,7 @@
     (unwind-protect
          (let ((title (thread-safe-make-string :char-string))
                (seq (thread-safe-make-string :dna5q-string))
-               (align (thread-safe-make-align :dna5q-string))
+               (align-view (thread-safe-make-align-view :dna5q-string))
                (next-progress-update (if (> (+ count 10000) local-file-count)
                                          local-file-count
                                          (+ count 10000))))
@@ -324,7 +334,7 @@
                              (when (sa:at-end seq-file)
                                (return-from read-loop count))
                              (sa:read-record title seq seq-file)
-                             (analyze-sequence align seq :verbose verbose))
+                             (analyze-sequence align-view seq :verbose verbose))
                  when (>= count next-progress-update)
                    do (progn
                         (incf next-progress-update 10000)
