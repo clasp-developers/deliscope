@@ -56,7 +56,7 @@
    (messages :initarg :messages :reader messages)
    (holder :initarg :holder :accessor holder)))
 
-(defun run-impl (serial-parallel parsers)
+(defun parse-impl (serial-parallel parsers)
   (let* ((container (make-instance 'jw:v-box))
          (panels (loop for parser in parsers
                        collect (cw:make-threaded-task-page
@@ -87,15 +87,15 @@
           do (cw:run-task panel))
     (values)))
 
-(defun run (&rest parsers)
+(defun parse (&rest parsers)
   "Parse sequence files one at a time but parsers are run in parallel."
-  (run-impl 'serial-analyze parsers))
+  (parse-impl 'serial-analyze parsers))
 
-(defun run-fast (&rest parsers)
+(defun parse-fast (&rest parsers)
   "Parse sequence files in parallel and parsers in parallel.
  This is experimental and depends on the SeqAn 2.0 library to be thread safe,
  which I am not absolutely certain it is.  If this crashes - use 'run'."
-  (run-impl 'parallel-analyze parsers))
+  (parse-impl 'parallel-analyze parsers))
 
 (defun plot-counts (data title)
   (let* ((x-data (coerce (subseq (mapcar #'car data) 0) 'vector))
