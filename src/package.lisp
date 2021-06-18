@@ -27,6 +27,7 @@
 
 
 
+   #:set-data-directory
    #:compare
    #:create-sequence-parser
    #:filtered-library-codes

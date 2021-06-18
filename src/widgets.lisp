@@ -16,20 +16,26 @@
           (core:count-lines-in-file file-name 1000000)
           (let ((estimate-lines (floor (* (/ file-size file-pos) num-lines))))
             (floor (/ estimate-lines 4))))))
-  
-(defun create-sequence-parser (name files &key num pass-file-name fail-file-name output-file-name (overwrite t))
-  (unless pass-file-name
-    (setf pass-file-name (make-pathname :name (format nil "~a-pass" (string-downcase (string name)))
-                                        :type "fastq")))
-  (unless fail-file-name
-    (setf fail-file-name (make-pathname :name (format nil "~a-fail" (string-downcase (string name)))
-                                        :type "fastq")))
+
+(defparameter *data-directory* nil)
+(defun set-data-directory (directory)
+  (setf directory (uiop:ensure-directory-pathname directory))
+  (unless (probe-file directory)
+    (error "The directory ~a does not exist" directory)
+    (setf *data-directory* directory)))
+
+(defun create-sequence-parser (name files &key num output-file-name (overwrite t))
   (unless output-file-name
     (setf output-file-name (make-pathname :name (format nil "~a-results" (string-downcase (string name)))
                                           :type "dat")))
   (unless overwrite
     (when (probe-file output-file-name)
       (error "Saving results will fail because the file ~a already exists" output-file-name)))
+  (let ((absolute-files (mapcar (lambda (file)
+                                  (if *data-directory*
+                                      (merge-pathname file :default *data-directory*)
+                                      file))
+                                files)))
   (format t "Scanning the files to count the number of sequences.~%")
   (format t "This may take a few minutes - hit ii to interrupt.~%")
   (finish-output)
@@ -37,7 +43,7 @@
                                      (estimate-sequences-in-file file :num num :verbose nil))
                                    files))
          (parser (make-instance 'parser :name name
-                                        :files files
+                                        :files absolute-files
                                         :num-sequences-per-file num-seq-per-file
                                         :pass-file-name pass-file-name
                                         :fail-file-name fail-file-name
