@@ -36,22 +36,22 @@
                                       (merge-pathname file :default *data-directory*)
                                       file))
                                 files)))
-  (format t "Scanning the files to count the number of sequences.~%")
-  (format t "This may take a few minutes - hit ii to interrupt.~%")
-  (finish-output)
-  (let* ((num-seq-per-file (lparallel:pmapcar (lambda (file)
-                                     (estimate-sequences-in-file file :num num :verbose nil))
-                                   files))
-         (parser (make-instance 'parser :name name
-                                        :files absolute-files
-                                        :num-sequences-per-file num-seq-per-file
-                                        :pass-file-name pass-file-name
-                                        :fail-file-name fail-file-name
-                                        :output-file-name output-file-name
-                                        :overwrite overwrite)))
-    (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
+    (format t "Scanning the files to count the number of sequences.~%")
+    (format t "This may take a few minutes - hit ii to interrupt.~%")
     (finish-output)
-    parser))
+    (let* ((num-seq-per-file (lparallel:pmapcar (lambda (file)
+                                                  (estimate-sequences-in-file file :num num :verbose nil))
+                                                files))
+           (parser (make-instance 'parser :name name
+                                          :files absolute-files
+                                          :num-sequences-per-file num-seq-per-file
+                                          :pass-file-name pass-file-name
+                                          :fail-file-name fail-file-name
+                                          :output-file-name output-file-name
+                                          :overwrite overwrite)))
+      (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
+      (finish-output)
+      parser)))
 
 
 (defparameter *progress* nil)

@@ -9,10 +9,22 @@
 (defparameter *minimum-counts* 100)
 
 (defclass align-view ()
-  ((align :initarg :align :accessor align)
+  ((metadata :initarg :metadata :accessor metadata)
+   (seq :initarg :seq :accessor seq)
+   (align :initarg :align :accessor align)
    (row0& :initarg :row0& :reader row0&)
    (row1& :initarg :row1& :reader row1&)))
-   
+
+(defun make-align-view ()
+  (let ((align (seqan:make-align :dna5q-string)))
+    (seqan:resize align 2)
+    (make-instance 'align-view
+                   :metadata (seqan:make-string :char-string)
+                   :seq (seqan:make-string :dna5q-string)
+                   :align align
+                   :row0& (seqan:row& align 0)
+                   :row1& (seqan:row& align 1))))
+                 
 (defclass parser ()
   ((name :initarg :name :accessor name)
    (files :initarg :files :accessor files)
@@ -39,6 +51,17 @@
   (format t "Sample sequences:~%")
   (show-hash-table (sequences filtering))
   (values))
+
+
+
+(defclass worker ()
+  ((resource-stack :initarg :resource-stack :reader resource-stack)
+   (worker-index :initarg :worker-index :reader worker-index)
+   (pass-file :initarg :pass-file :accessor pass-file)
+   (pass-file-lock :initarg :pass-file-lock :accessor pass-file-lock)
+   (fail-file :initarg :fail-file :accessor fail-file)
+   (fail-file-lock :initarg :fail-file-lock :accessor fail-file-lock)
+   (result :initform (make-hash-table :test #'equal) :accessor result)))
 
 (defclass job-tracker ()
   ((sequence-count :initform 0 :accessor sequence-count)
@@ -331,6 +354,97 @@
          (sa:make-string type))
     (bt:release-lock *string-lock*)))
 
+(defun wait-for-sequence (worker queue worker-callback)
+  (let ((next-progress-update 10000))
+    (loop named work-loop
+          for sequence-count from 0
+          with good-sequence-count = 0
+          for job = (let ((job (lparallel.queue:pop-queue)))
+                      (when (eq job :quit)
+                        (return-from work-loop nil))
+                      job)
+          for metadata = (metadata job)
+          for seq = (seq job)
+          for align-view = (align-view job)
+          for result = (analyze-sequence align-view seq :verbose verbose)
+          when (>= sequence-count next-progress-update)
+            do (progn
+                 (incf next-progress-update 10000)
+                 (when worker-callback
+                   (funcall worker-callback (worker-index worker) sequence-count good-sequence-count 9999)))
+          if (accept-result result)
+            do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
+                 (incf good-sequence-count)
+                 (incf (gethash key (results worker) 0))
+                 (when (pass-file worker)
+                   (mp:with-lock (pass-file-lock worker)
+                     (sa:write-record (pass-file worker) metadata seq))))
+          else
+            do (when (fail-file worker)
+                 (mp:with-lock (fail-file-lock worker)
+                   (sa:write-record (fail-file worker) metadata seq)))
+          finally (when progress callback
+                        (funcall worker-callback (worker-index worker) sequence-count good-sequence-count 9999)))))
+
+
+(defun analyze-files-using-workers (number-of-workers files estimated-sequences &key progress-callback pass-fail-files verbose testing)
+  (when pass-fail-files
+    (let* ((pass-file-name (make-pathname
+                            :name (format nil "~a-pass" (pathname-name (pathname file-name)))
+                            :type "fastq" :defaults (pathname file-name)))
+           (fail-file-name (make-pathname
+                            :name (format nil "~a-fail" (pathname-name (pathname file-name)))
+                            :type "fastq" :defaults (pathname file-name))))
+      (setf pass-file (sa:make-seq-file-out (namestring pass-file-name))
+            fail-file (sa:make-seq-file-out (namestring fail-file-name)))))
+  ;; Create resources
+  (let* ((number-of-resources (* number-of-workers 10))
+         (resources (cons (loop for index below number-of-resources
+                                collect (make-align-view))
+                          nil)))
+    ;; Create workers
+    (let* ((queue (lparallel.queue:make-queue :fixed-capacity number-of-resources))
+           (workers (loop for index below number-of-workers
+                          for worker = (make-instance 'worker
+                                                      :worker-index index
+                                                      :resource-stack resources
+                                                      :pass-file pass-file
+                                                      :pass-file-lock (when pass-file (bt:make-lock "pass-file"))
+                                                      :fail-file fail-file
+                                                      :fail-file-lock (when fail-file (bt:make-lock "fail-file")))
+                          collect worker)))
+      (loop for worker in workers
+            do (bt:make-thread
+                (lambda () (wait-for-sequence *worker* *queue*))
+                :initial-bindings (list ('*worker* worker)
+                                        ('*queue* queue))))
+      ;; Reader process
+      (loop for file in files
+            with sequence-counter = 0
+            for seq-file = (seqan:make-file-in file)
+            do (unwind-protect
+                    (loop names read-loop
+                     for data = (mp:atomic-pop (car resources))
+                     do (progn
+                          (when (sa:at-end seq-file)
+                            (return-from read-loop nil))
+                          (sa:read-record (metadata data)
+                                          (seq data)
+                                          seq-file)
+                          (incf sequence-counter)
+                          (when (and max-sequences (> sequence-counter max-sequences))
+                            (
+                          (unless testing
+                            (lparallel.queue:push-queue data queue)))))
+      ;; Accumulate the results
+      (let ((sequences (make-hash-table :test 'equal)))
+        (loop for worker across workers
+              for result = (result worker)
+              do (maphash (lambda (seq counts)
+                            (incf (gethash seq sequences 0) counts))
+                        result))
+
+         
 (defun analyze-one-file (file-index file-name local-file-count &key progress-callback pass-fail-files verbose)
   (let ((sequences (make-hash-table :test 'equal))
         (seq-file (sa:make-seq-file-in file-name))
@@ -359,6 +473,7 @@
                  for res = (progn
                              (when (sa:at-end seq-file)
                                (return-from read-loop count))
+                             (core:check-pending-interrupts)
                              (sa:read-record title seq seq-file)
                              (analyze-sequence align-view seq :verbose verbose))
                  when (>= count next-progress-update)
@@ -729,7 +844,7 @@ all copies or substantial portions of the Software.
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
