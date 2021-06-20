@@ -13,44 +13,45 @@
   (if num
       num
       (multiple-value-bind (num-lines file-pos file-size)
-          (core:count-lines-in-file file-name 1000000)
+          (core:count-lines-in-file (namestring file-name) 1000000)
           (let ((estimate-lines (floor (* (/ file-size file-pos) num-lines))))
             (floor (/ estimate-lines 4))))))
 
-(defparameter *data-directory* nil)
+(defvar *data-directory* nil)
 (defun set-data-directory (directory)
-  (setf directory (uiop:ensure-directory-pathname directory))
+  (setf directory (uiop:ensure-directory-pathname (pathname directory)))
   (unless (probe-file directory)
-    (error "The directory ~a does not exist" directory)
-    (setf *data-directory* directory)))
+    (error "The directory ~a does not exist" directory))
+  (format t "data directory set to ~a~%" directory)
+  (setf *data-directory* directory))
 
-(defun create-sequence-parser (name files &key num output-file-name (overwrite t))
-  (unless output-file-name
-    (setf output-file-name (make-pathname :name (format nil "~a-results" (string-downcase (string name)))
-                                          :type "dat")))
-  (unless overwrite
-    (when (probe-file output-file-name)
-      (error "Saving results will fail because the file ~a already exists" output-file-name)))
-  (let ((absolute-files (mapcar (lambda (file)
-                                  (if *data-directory*
-                                      (merge-pathnames file :default *data-directory*)
-                                      file))
-                                files)))
-    (format t "Scanning the files to count the number of sequences.~%")
-    (format t "This may take a few minutes - hit ii to interrupt.~%")
-    (finish-output)
-    (let* ((num-seq-per-file (lparallel:pmapcar (lambda (file)
-                                                  (estimate-sequences-in-file file :num num :verbose nil))
-                                                files))
-           (parser (make-instance 'parser :name name
-                                          :files absolute-files
-                                          :num-sequences-per-file num-seq-per-file
-                                          :output-file-name output-file-name
-                                          :overwrite overwrite)))
-      (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
+(defun create-sequence-parser (name &rest args)
+  (let ((output-file-name (make-pathname :name (format nil "~a-results" (string-downcase (string name)))
+                                         :type "dat"))
+        (overwrite t))
+    (when (eq (car args) :output)
+      (pop args)
+      (setf output-file-name (pop args)))
+    (let* ((files args)
+           (absolute-files (mapcar (lambda (file)
+                                     (if *data-directory*
+                                         (merge-pathnames file *data-directory*)
+                                         file))
+                                   files)))
+      (format t "Scanning the files to count the number of sequences.~%")
+      (format t "This may take a few minutes - hit ii to interrupt.~%")
       (finish-output)
-      parser)))
-
+      (let* ((num-seq-per-file (mapcar (lambda (file)
+                                         (estimate-sequences-in-file file :verbose nil))
+                                       absolute-files))
+             (parser (make-instance 'parser :name name
+                                            :files absolute-files
+                                            :num-sequences-per-file num-seq-per-file
+                                            :output-file-name output-file-name
+                                            :overwrite overwrite)))
+        (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
+        (finish-output)
+        parser))))
 
 (defparameter *progress* nil)
 (defparameter *parser* nil)
@@ -60,38 +61,51 @@
    (messages :initarg :messages :reader messages)
    (holder :initarg :holder :accessor holder)))
 
-(defun parse (&rest parsers)
-  (let* ((container (make-instance 'jw:v-box))
-         (panel (cw:make-threaded-task-page
-                 container
-                 (format nil "Parse")
-                 (lambda (instance action parser progress-callback)
-                   (declare (ignore action))
-                   (analyze-parsers-using-workers
-                    (core:num-logical-processors)
-                    parsers
-                    :progress-callback
-                    (let ((last-val -1))
-                      (lambda (val msg &key done)
-                        (if done
-                            (format t "Done.~%")
-                            (progn
-;;;                            (when (> val last-val)
-                              (setf last-val val)
+(defun parse (&rest args)
+  "Usage: (parse [:limit <integer>] <parsers>...)
+
+Parse the sequences specified by each parser.
+You can limit the number sequences loaded from each file within each parser by adding :limit <num>.
+"
+  (let ((limit nil))
+    (when (eq (car args) :limit)
+      (pop args)
+      (setf limit (pop args))
+      (unless (integerp limit)
+        (error "limit must be an integer")))
+    (let* ((parsers args)
+           (container (make-instance 'jw:v-box))
+           (panel (cw:make-threaded-task-page
+                   container
+                   (format nil "Parse")
+                   (lambda (instance action parsers progress-callback)
+                     (declare (ignore action instance))
+                     (analyze-parsers-using-workers
+                      (core:num-logical-processors)
+                      parsers
+                      :max-sequences-per-file limit
+                      :progress-callback
+                      (let ((last-val -1))
+                        (lambda (val msg &key done)
+                          (if done
+                              (format t "Done.~%")
                               (progn
-                                (format t "Progress: ~a~%" val)
-                                (format t "~a~%" msg)
-                                (finish-output)
-                                (funcall progress-callback :value val
-                                                           :maximum 100))
-;;;                              )
-                              )))))
-                   t)
-                 :parameter parsers
-                 :label "Click button to start.")))
-    (j:display container)
-    (cw:run-task panel)
-    (values)))
+                                (when (> val last-val)
+                                  (setf last-val val)
+                                  (progn
+                                    (format t "Progress: ~a~%" val)
+                                    (format t "~a~%" msg)
+                                    (finish-output)
+                                    (funcall progress-callback :value val
+                                                               :maximum 100))
+                                  )
+                                )))))
+                     t)
+                   :parameter parsers
+                   :label "Click button to start.")))
+      (j:display container)
+      (cw:run-task panel)
+      (values))))
 
 
 (defun plot-counts (data title)
