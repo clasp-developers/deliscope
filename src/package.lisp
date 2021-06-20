@@ -24,8 +24,9 @@
    #:load-results
    #:multiple-redundant
    #:merge-hits
-
-
+   #:process-results
+   #:plot-unfiltered-counts
+   #:plot-filtered-counts
 
    #:set-data-directory
    #:compare
@@ -35,7 +36,6 @@
    #:redundancies
    #:save-csv
    #:parse
-   #:parse-fast
    ))
    
 
