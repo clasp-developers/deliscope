@@ -33,7 +33,7 @@
       (error "Saving results will fail because the file ~a already exists" output-file-name)))
   (let ((absolute-files (mapcar (lambda (file)
                                   (if *data-directory*
-                                      (merge-pathname file :default *data-directory*)
+                                      (merge-pathnames file :default *data-directory*)
                                       file))
                                 files)))
     (format t "Scanning the files to count the number of sequences.~%")
@@ -45,8 +45,6 @@
            (parser (make-instance 'parser :name name
                                           :files absolute-files
                                           :num-sequences-per-file num-seq-per-file
-                                          :pass-file-name pass-file-name
-                                          :fail-file-name fail-file-name
                                           :output-file-name output-file-name
                                           :overwrite overwrite)))
       (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
@@ -62,46 +60,39 @@
    (messages :initarg :messages :reader messages)
    (holder :initarg :holder :accessor holder)))
 
-(defun parse-impl (serial-parallel parsers)
+(defun parse (&rest parsers)
   (let* ((container (make-instance 'jw:v-box))
-         (panels (loop for parser in parsers
-                       collect (cw:make-threaded-task-page
-                                container
-                                (format nil "Task ~a" (name parser))
-                                (lambda (instance action parser progress-callback)
-                                  (declare (ignore action))
-                                  (funcall serial-parallel
-                                           parser
-                                           :progress-callback
-                                           (let ((last-val -1))
-                                             (lambda (val msg &key done)
-                                               (if done
-                                                   (format t "Done.~%")
-                                                   (when (> val last-val)
-                                                     (setf last-val val)
-                                                     (progn
-                                                       (format t "Progress: ~a~%" val)
-                                                       (format t "~a~%" msg)
-                                                       (finish-output)
-                                                       (funcall progress-callback :value val
-                                                                                  :maximum 100)))))))
-                                  t)
-                                :parameter parser
-                                :label "Click button to start."))))
+         (panel (cw:make-threaded-task-page
+                 container
+                 (format nil "Parse")
+                 (lambda (instance action parser progress-callback)
+                   (declare (ignore action))
+                   (analyze-parsers-using-workers
+                    (core:num-logical-processors)
+                    parsers
+                    :progress-callback
+                    (let ((last-val -1))
+                      (lambda (val msg &key done)
+                        (if done
+                            (format t "Done.~%")
+                            (progn
+;;;                            (when (> val last-val)
+                              (setf last-val val)
+                              (progn
+                                (format t "Progress: ~a~%" val)
+                                (format t "~a~%" msg)
+                                (finish-output)
+                                (funcall progress-callback :value val
+                                                           :maximum 100))
+;;;                              )
+                              )))))
+                   t)
+                 :parameter parsers
+                 :label "Click button to start.")))
     (j:display container)
-    (loop for panel in panels
-          do (cw:run-task panel))
+    (cw:run-task panel)
     (values)))
 
-(defun parse (&rest parsers)
-  "Parse sequence files one at a time but parsers are run in parallel."
-  (parse-impl 'serial-analyze parsers))
-
-(defun parse-fast (&rest parsers)
-  "Parse sequence files in parallel and parsers in parallel.
- This is experimental and depends on the SeqAn 2.0 library to be thread safe,
- which I am not absolutely certain it is.  If this crashes - use 'run'."
-  (parse-impl 'parallel-analyze parsers))
 
 (defun plot-counts (data title)
   (let* ((x-data (coerce (subseq (mapcar #'car data) 0) 'vector))

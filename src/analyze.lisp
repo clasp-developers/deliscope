@@ -8,29 +8,43 @@
 (defparameter *low-quality-max* 2)
 (defparameter *minimum-counts* 100)
 
-(defclass align-view ()
+(defclass outputs ()
+  ((pass-file :initarg :pass-file :accessor pass-file)
+   (pass-file-lock :initarg :pass-file-lock :accessor pass-file-lock)
+   (fail-file :initarg :fail-file :accessor fail-file)
+   (fail-file-lock :initarg :fail-file-lock :accessor fail-file-lock)))
+
+(defclass sequence-align ()
   ((metadata :initarg :metadata :accessor metadata)
    (seq :initarg :seq :accessor seq)
    (align :initarg :align :accessor align)
    (row0& :initarg :row0& :reader row0&)
-   (row1& :initarg :row1& :reader row1&)))
+   (row1& :initarg :row1& :reader row1&)
+   (pass-fail :accessor pass-fail)
+   (results :accessor results)
+   (results-lock :accessor results-lock)))
 
-(defun make-align-view ()
-  (let ((align (seqan:make-align :dna5q-string)))
-    (seqan:resize align 2)
-    (make-instance 'align-view
-                   :metadata (seqan:make-string :char-string)
-                   :seq (seqan:make-string :dna5q-string)
-                   :align align
-                   :row0& (seqan:row& align 0)
-                   :row1& (seqan:row& align 1))))
+(defparameter *seqan-make-lock* (bt:make-lock 'seqan-make-lock))
+(defun make-sequence-align ()
+  "seqan doesn't appear to have thread safe allocators - so we use a lock
+when allocating align and string objects"
+  (unwind-protect
+       (progn
+         (bt:acquire-lock *seqan-make-lock*)
+         (let ((align (seqan:make-align :dna5q-string)))
+           (seqan:resize (sa:rows& align) 2)
+           (make-instance 'sequence-align
+                          :metadata (seqan:make-string :char-string)
+                          :seq (seqan:make-string :dna5q-string)
+                          :align align
+                          :row0& (seqan:row& align 0)
+                          :row1& (seqan:row& align 1))))
+    (bt:release-lock *seqan-make-lock*)))
                  
 (defclass parser ()
   ((name :initarg :name :accessor name)
    (files :initarg :files :accessor files)
    (num-sequences-per-file :initarg :num-sequences-per-file :accessor num-sequences-per-file)
-   (pass-file-name :initarg :pass-file-name :accessor pass-file-name)
-   (fail-file-name :initarg :fail-file-name :accessor fail-file-name)
    (output-file-name :initarg :output-file-name :accessor output-file-name)
    (overwrite :initarg :overwrite :accessor overwrite)
    ))
@@ -52,34 +66,22 @@
   (show-hash-table (sequences filtering))
   (values))
 
-
-
 (defclass worker ()
   ((resource-stack :initarg :resource-stack :reader resource-stack)
    (worker-index :initarg :worker-index :reader worker-index)
-   (pass-file :initarg :pass-file :accessor pass-file)
-   (pass-file-lock :initarg :pass-file-lock :accessor pass-file-lock)
-   (fail-file :initarg :fail-file :accessor fail-file)
-   (fail-file-lock :initarg :fail-file-lock :accessor fail-file-lock)
-   (result :initform (make-hash-table :test #'equal) :accessor result)))
+   (thread :initform nil :accessor thread)))
 
 (defclass job-tracker ()
   ((sequence-count :initform 0 :accessor sequence-count)
-   (good-sequence-count :initform 0 :accessor good-sequence-count)
-   (seq-file-position :initform 0 :accessor seq-file-position)
-   (seq-file-length :initform 0 :accessor seq-file-length)
-   (result :accessor result)))
+   (good-sequence-count :initform 0 :accessor good-sequence-count)))
 
 (defun sum-trackers (sum-tracker trackers)
   (loop for index below (length trackers)
         for tracker = (elt trackers index)
         sum (sequence-count tracker) into sequence-count-sum
         sum (good-sequence-count tracker) into good-sequence-count-sum
-        sum (seq-file-position tracker) into seq-file-position-sum
         finally (setf (sequence-count sum-tracker) sequence-count-sum
-                      (good-sequence-count sum-tracker) good-sequence-count-sum
-                      (seq-file-position sum-tracker) seq-file-position-sum)))
-
+                      (good-sequence-count sum-tracker) good-sequence-count-sum)))
 
 (defclass all-codes ()
   ((column-codes :initarg :column-codes :accessor column-codes)
@@ -115,7 +117,6 @@
             (low-quality-count object)
             (quality-string object))))
 
-
 (defun hamming-distance (aaa bbb)
   (let ((hamming 0))
     (loop for pos below (length aaa)
@@ -136,7 +137,6 @@
                    for hamming = (hamming-distance seqa seqb)
                    do (setf (aref mat posa posb) hamming)))
   mat))
-
 
 (defun calculate-del-name (digit1 digit2 digit34 &key debug)
   (declare (ignore debug))
@@ -214,7 +214,12 @@
   (setf *library-code* library-code)
   (setf *minimum-counts* minimum-counts))
 
-(defun analyze-column-using-align (align-view sequence column-codes start adjust low-quality-count quality-string &key verbose)
+(defmacro vformat (verbose stream fmt &rest args)
+  `(when ,verbose
+     (bt:with-lock-held (,verbose)
+       (format ,stream ,fmt ,@args))))
+
+(defun analyze-column-using-align (sequence-align sequence column-codes start adjust low-quality-count quality-string &key verbose)
   (let* ((abs-start (+ start (start column-codes) adjust))
          (best-score -999999)
          (best-row-code nil))
@@ -224,14 +229,13 @@
           for lower-diag = (- abs-start 1)
           for upper-diag = (+ lower-diag 1) ;;+ start end-offset )
           for score = (progn
-                        (sa:assign-source (row0& align-view) sequence)
-                        (sa:assign-source (row1& align-view) code)
-                        (sa:global-alignment (align align-view) *simple-score* *align-config*
+                        (sa:assign-source (row0& sequence-align) sequence)
+                        (sa:assign-source (row1& sequence-align) code)
+                        (sa:global-alignment (align sequence-align) *simple-score* *align-config*
                                                           lower-diag
                                                           upper-diag ))
-          do (when verbose
-               (format t "Score: ~a~%" score)
-               (format t "~a~%" (sa:to-string (align align-view))))
+          do (vformat verbose t "Score: ~a~%" score)
+             (vformat verbose t "~a~%" (sa:to-string (align sequence-align)))
           do (when (> score best-score)
                (setf best-score score
                      best-row-code row-code)))
@@ -245,14 +249,14 @@
   (let* ((seq-string (sa:to-string sequence))
          (abs-start (+ start (start column-codes) adjust))
          (abs-end (+ start (end column-codes) adjust)))
-    (when verbose (format t "abs-start: ~d  abs-end ~d Subsequence: ~a~%" abs-start abs-end (subseq (sa:to-string sequence) (1- abs-start) (1- abs-end))))
+    (vformat verbose t "abs-start: ~d  abs-end ~d Subsequence: ~a~%" abs-start abs-end (subseq (sa:to-string sequence) (1- abs-start) (1- abs-end)))
     (loop for row-code in (codes column-codes)
           for code-seq = (sequence row-code)
           when (string= seq-string code-seq :start1 (1- abs-start) :end1 (1- abs-end))
             do (return-from analyze-column-fast (values t row-code)))
     (values nil)))
 
-(defun analyze-column (align-view sequence column-codes start adjust &key verbose)
+(defun analyze-column (sequence-align sequence column-codes start adjust &key verbose)
   (let* ((abs-start (+ start (start column-codes) adjust))
          (abs-end (+ start (end column-codes) adjust)))
     (multiple-value-bind (low-quality-count qual-string)
@@ -264,34 +268,34 @@
                                                             :low-quality-count low-quality-count
                                                             :row-code row-code
                                                             :quality-string qual-string))))
-      (analyze-column-using-align align-view sequence column-codes start adjust low-quality-count qual-string :verbose verbose))))
+      (analyze-column-using-align sequence-align sequence column-codes start adjust low-quality-count qual-string :verbose verbose))))
 
-(defun analyze-forward-primer (align-view sequence &key verbose)
-  (sa:assign-source (row0& align-view) sequence)
-  (sa:assign-source (row1& align-view) (forward-primer *all-codes*))
-  (let ((fwd-score (sa:global-alignment (align align-view) *simple-score* *align-config*))
-        (start (1+ (sa:to-view-position (row1& align-view) (sa:length (forward-primer *all-codes*))))))
-    (when verbose (format t "Alignment: ~%~a~%" (sa:to-string (align align-view))))
+(defun analyze-forward-primer (sequence-align sequence &key verbose)
+  (sa:assign-source (row0& sequence-align) sequence)
+  (sa:assign-source (row1& sequence-align) (forward-primer *all-codes*))
+  (let ((fwd-score (sa:global-alignment (align sequence-align) *simple-score* *align-config*))
+        (start (1+ (sa:to-view-position (row1& sequence-align) (sa:length (forward-primer *all-codes*))))))
+    (vformat verbose t "Alignment: ~%~a~%" (sa:to-string (align sequence-align)))
     (values start fwd-score)))
 
-(defun analyze-sequence (align-view sequence &key verbose)
-  (multiple-value-bind (start fwd-score)
-      (analyze-forward-primer align-view sequence :verbose verbose)
-    (declare (ignore fwd-score))
-    (when verbose
-      (format t "len fwd: ~a~%" (sa:length (forward-primer *all-codes*)))
-      (format t "3' end: ~a~%" start)
-      (format t "~a~%" (sa:to-string (align align-view))))
-    (when (> (sa:length sequence) (+ start (end *all-codes*)))
-      (let ((result (loop for column-codes in (column-codes *all-codes*)
-                          for start-offset = (start column-codes)
-                          for end-offset = (end column-codes)
-                          for best-digit = (analyze-column align-view sequence column-codes start 0 :verbose verbose)
-                          do (when verbose (format t "offset: ~a best-digits: ~a~%" start-offset best-digit))
-                          collect best-digit)))
-        (when verbose
-          (format t "result: ~a~%" result))
-        result))))
+(defun analyze-sequence (sequence-align &key verbose worker)
+  (vformat verbose t "worker: ~a analyze-sequence for ~a~%" worker sequence-align)
+  (let ((sequence (seq sequence-align)))
+    (multiple-value-bind (start fwd-score)
+        (analyze-forward-primer sequence-align sequence :verbose verbose)
+      (declare (ignore fwd-score))
+      (vformat verbose t "worker: ~a len fwd: ~a~%" worker (sa:length (forward-primer *all-codes*)))
+      (vformat verbose t "worker: ~a 3' end: ~a~%" worker start)
+      (vformat verbose t "worker: ~a ~a~%" worker (sa:to-string (align sequence-align)))
+      (when (> (sa:length sequence) (+ start (end *all-codes*)))
+        (let ((result (loop for column-codes in (column-codes *all-codes*)
+                            for start-offset = (start column-codes)
+                            for end-offset = (end column-codes)
+                            for best-digit = (analyze-column sequence-align sequence column-codes start 0 :verbose verbose)
+                            do (vformat verbose t "worker: ~a offset: ~a best-digits: ~a~%" worker start-offset best-digit)
+                            collect best-digit)))
+          (vformat verbose t "worker: ~a result: ~a~%" worker result)
+        result)))))
 
 
 (defvar *filtering* (make-hash-table :test 'equal))
@@ -304,303 +308,214 @@
        (every (lambda (x) (< (low-quality-count x) *low-quality-max*)) result)))
 
 
-(defun evaluate-progress (start-time sum-tracker total-count)
-  (let ((count (sequence-count sum-tracker)))
-    (if (= count 0)
-        (let ((msg (format nil "Read ~a of ~a~%Estimating remaining time...~%" count total-count)))
-          (values 0 msg))
-        (let* ((good-sequence-count (good-sequence-count sum-tracker))
-               (current-time (get-internal-real-time))
-               (elapsed-seconds (float (/ (- current-time start-time) internal-time-units-per-second)))
-               (remaining-seconds (if (= count 0) 9999999.0 (- (* (/ total-count count) elapsed-seconds) elapsed-seconds)))
-               (remaining-minutes (/ remaining-seconds 60.0))
-               (remaining-hours (/ remaining-minutes 60.0)))
-          (multiple-value-bind (hours minutes)
-              (if (< remaining-hours 0.0)
-                  (values 0 0)
-                  (floor remaining-hours))
-            (labels ((time-description (hours minutes)
-                       (if (zerop hours)
-                           (format nil "~4,1f minute~:p" minutes)
-                           (format nil "~a hour~:p ~4,1f minute~:p" hours minutes))))
-              (let ((msg (format nil "Read ~a of ~a~%Good sequences: ~a~%Estimated remaining time: ~a~%"
-                                 count total-count
-                                 good-sequence-count
-                                 (time-description hours (* 60.0 minutes))))
-                    (progress (floor (float (* 100.0 (/ count total-count))))))
-                (values progress msg))))))))
+(defun evaluate-progress (start-time count good-sequence-count total-count)
+  (if (= count 0)
+      (let ((msg (format nil "Read ~a of ~a~%Estimating remaining time...~%" count total-count)))
+        (values 0 msg))
+      (let* ((current-time (get-internal-real-time))
+             (elapsed-seconds (float (/ (- current-time start-time) internal-time-units-per-second)))
+             (remaining-seconds (if (= count 0) 9999999.0 (- (* (/ total-count count) elapsed-seconds) elapsed-seconds)))
+             (remaining-minutes (/ remaining-seconds 60.0))
+             (remaining-hours (/ remaining-minutes 60.0)))
+        (multiple-value-bind (hours minutes)
+            (if (< remaining-hours 0.0)
+                (values 0 0)
+                (floor remaining-hours))
+          (labels ((time-description (hours minutes)
+                     (if (zerop hours)
+                         (format nil "~4,1f minute~:p" minutes)
+                         (format nil "~a hour~:p ~4,1f minute~:p" hours minutes))))
+            (let ((msg (format nil "Read ~a of ~a~%Good sequences: ~a~%Estimated remaining time: ~a~%"
+                               count total-count
+                               good-sequence-count
+                               (time-description hours (* 60.0 minutes))))
+                  (progress (floor (float (* 100.0 (/ count total-count))))))
+              (values progress msg)))))))
 
-(defparameter *align-lock* (bt:make-lock 'align-lock))
-(defun thread-safe-make-align-view (type)
-  (unwind-protect
-       (progn
-         (bt:acquire-lock *align-lock*)
-         (let* ((align (sa:make-align type))
-                (rows& (sa:rows& align)))
-           (sa:resize rows& 2)
-           (let ((row0& (sa:row& align 0))
-                 (row1& (sa:row& align 1)))
-             (make-instance 'align-view
-                            :align align
-                            :row0& row0&
-                            :row1& row1&))))
-    (bt:release-lock *align-lock*)))
 
-(defparameter *string-lock* (bt:make-lock 'string-lock))
-(defun thread-safe-make-string (type)
-  (unwind-protect
-       (progn
-         (bt:acquire-lock *string-lock*)
-         (sa:make-string type))
-    (bt:release-lock *string-lock*)))
-
-(defun wait-for-sequence (worker queue worker-callback)
-  (let ((next-progress-update 10000))
+(defun wait-for-sequence (worker queue worker-callback &key verbose)
+  (let ((next-progress-update 1000))
     (loop named work-loop
           for sequence-count from 0
           with good-sequence-count = 0
-          for job = (let ((job (lparallel.queue:pop-queue)))
-                      (when (eq job :quit)
-                        (return-from work-loop nil))
-                      job)
-          for metadata = (metadata job)
-          for seq = (seq job)
-          for align-view = (align-view job)
-          for result = (analyze-sequence align-view seq :verbose verbose)
+          for sequence-align = (progn
+                                 (vformat verbose t "worker: ~a About to pop queue~%" (worker-index worker))
+                                 (let ((job (lparallel.queue:pop-queue queue)))
+                                   (when (eq job :quit)
+                                     (vformat verbose t "worker ~a exiting~%" (worker-index worker))
+                                     (return-from work-loop nil))
+                                   (unless job
+                                     (vformat verbose t "worker: ~a got nil as job~%" (worker-index worker)))
+                                   job))
+          for metadata = (metadata sequence-align)
+          for seq = (seq sequence-align)
+          for pass-fail = (pass-fail sequence-align)
+          for result = (progn
+                         (analyze-sequence sequence-align :verbose verbose :worker (worker-index worker)))
           when (>= sequence-count next-progress-update)
             do (progn
-                 (incf next-progress-update 10000)
+                 (incf next-progress-update 1000)
                  (when worker-callback
-                   (funcall worker-callback (worker-index worker) sequence-count good-sequence-count 9999)))
-          if (accept-result result)
-            do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
+                   (funcall worker-callback (worker-index worker) sequence-count good-sequence-count)))
+          if (and result (accept-result result))
+            do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) result)))
                  (incf good-sequence-count)
-                 (incf (gethash key (results worker) 0))
-                 (when (pass-file worker)
-                   (mp:with-lock (pass-file-lock worker)
-                     (sa:write-record (pass-file worker) metadata seq))))
+                 (bt:with-lock-held ((results-lock sequence-align))
+                   (incf (gethash key (results sequence-align) 0)))
+                 (when pass-fail
+                   (mp:with-lock ((pass-file-lock pass-fail))
+                     (sa:write-record (pass-file pass-fail) metadata seq))))
           else
-            do (when (fail-file worker)
-                 (mp:with-lock (fail-file-lock worker)
-                   (sa:write-record (fail-file worker) metadata seq)))
-          finally (when progress callback
-                        (funcall worker-callback (worker-index worker) sequence-count good-sequence-count 9999)))))
+            do (when pass-fail
+                 (mp:with-lock ((fail-file-lock pass-fail))
+                   (sa:write-record (fail-file pass-fail) metadata seq)))
+          do (vformat verbose t "worker: ~a atomic-push of resource back on stack~%" (worker-index worker))
+          do (mp:atomic-push sequence-align (car (resource-stack worker))) ; recycle the sequence-align 
+          finally (when worker-callback
+                    (funcall worker-callback (worker-index worker) sequence-count good-sequence-count)))))
 
 
-(defun analyze-files-using-workers (number-of-workers files estimated-sequences &key progress-callback pass-fail-files verbose testing)
-  (when pass-fail-files
-    (let* ((pass-file-name (make-pathname
-                            :name (format nil "~a-pass" (pathname-name (pathname file-name)))
-                            :type "fastq" :defaults (pathname file-name)))
-           (fail-file-name (make-pathname
-                            :name (format nil "~a-fail" (pathname-name (pathname file-name)))
-                            :type "fastq" :defaults (pathname file-name))))
-      (setf pass-file (sa:make-seq-file-out (namestring pass-file-name))
-            fail-file (sa:make-seq-file-out (namestring fail-file-name)))))
-  ;; Create resources
-  (let* ((number-of-resources (* number-of-workers 10))
-         (resources (cons (loop for index below number-of-resources
-                                collect (make-align-view))
-                          nil)))
-    ;; Create workers
-    (let* ((queue (lparallel.queue:make-queue :fixed-capacity number-of-resources))
-           (workers (loop for index below number-of-workers
-                          for worker = (make-instance 'worker
-                                                      :worker-index index
-                                                      :resource-stack resources
-                                                      :pass-file pass-file
-                                                      :pass-file-lock (when pass-file (bt:make-lock "pass-file"))
-                                                      :fail-file fail-file
-                                                      :fail-file-lock (when fail-file (bt:make-lock "fail-file")))
-                          collect worker)))
-      (loop for worker in workers
-            do (bt:make-thread
-                (lambda () (wait-for-sequence *worker* *queue*))
-                :initial-bindings (list ('*worker* worker)
-                                        ('*queue* queue))))
-      ;; Reader process
-      (loop for file in files
-            with sequence-counter = 0
-            for seq-file = (seqan:make-file-in file)
-            do (unwind-protect
-                    (loop names read-loop
-                     for data = (mp:atomic-pop (car resources))
-                     do (progn
-                          (when (sa:at-end seq-file)
-                            (return-from read-loop nil))
-                          (sa:read-record (metadata data)
-                                          (seq data)
-                                          seq-file)
-                          (incf sequence-counter)
-                          (when (and max-sequences (> sequence-counter max-sequences))
-                            (
-                          (unless testing
-                            (lparallel.queue:push-queue data queue)))))
-      ;; Accumulate the results
-      (let ((sequences (make-hash-table :test 'equal)))
-        (loop for worker across workers
-              for result = (result worker)
-              do (maphash (lambda (seq counts)
-                            (incf (gethash seq sequences 0) counts))
-                        result))
-
-         
-(defun analyze-one-file (file-index file-name local-file-count &key progress-callback pass-fail-files verbose)
-  (let ((sequences (make-hash-table :test 'equal))
-        (seq-file (sa:make-seq-file-in file-name))
-        (pass-file nil)
-        (fail-file nil)
-        (count 0)
-        (good-sequence-count 0))
-    (when pass-fail-files
-      (let* ((pass-file-name (make-pathname
-                              :name (format nil "~a-pass" (pathname-name (pathname file-name)))
-                              :type "fastq" :defaults (pathname file-name)))
-             (fail-file-name (make-pathname
-                              :name (format nil "~a-fail" (pathname-name (pathname file-name)))
-                              :type "fastq" :defaults (pathname file-name))))
-        (setf pass-file (sa:make-seq-file-out (namestring pass-file-name))
-              fail-file (sa:make-seq-file-out (namestring fail-file-name)))))
+(defparameter *worker* nil)
+(defparameter *queue* nil)
+(defparameter *verbose* nil)
+(defun analyze-parsers-using-workers (number-of-workers parsers
+                                      &key max-sequences-per-parser progress-callback pass-fail-files verbose testing)
+  (declare (ignore progress-callback))
+  (vformat verbose t "Entered analyze-files-using-workers ~a~%" files)
+  ;; Create resources and workers
+  (let* ((sequence-count 0)
+         (start-time (get-internal-real-time))
+         (callback-lock (bt:make-lock "callback-lock"))
+         (estimated-sequences (loop for parser in parsers
+                                    sum (loop for num in (num-sequences-per-file parser)
+                                              sum num)))
+         (trackers (make-array number-of-workers
+                               :initial-contents
+                               (loop for id below number-of-workers
+                                     collect (make-instance 'job-tracker))))
+         (number-of-resources (+ 5 (* number-of-workers 10)))
+         (resources (cons (loop for index to (* 2 number-of-resources)
+                                collect (make-sequence-align))
+                          nil))
+         (queue (lparallel.queue:make-queue :fixed-capacity number-of-resources))
+         (workers (loop for index below number-of-workers
+                        for worker = (make-instance 'worker
+                                                    :worker-index index
+                                                    :resource-stack resources)
+                        collect worker)))
+    ;; Create the threads
     (unwind-protect
-         (let ((title (thread-safe-make-string :char-string))
-               (seq (thread-safe-make-string :dna5q-string))
-               (align-view (thread-safe-make-align-view :dna5q-string))
-               (next-progress-update (if (> (+ count 10000) local-file-count)
-                                         local-file-count
-                                         (+ count 10000))))
-           (loop named read-loop
-                 for index from 0
-                 for res = (progn
-                             (when (sa:at-end seq-file)
-                               (return-from read-loop count))
-                             (core:check-pending-interrupts)
-                             (sa:read-record title seq seq-file)
-                             (analyze-sequence align-view seq :verbose verbose))
-                 when (>= count next-progress-update)
-                   do (progn
-                        (incf next-progress-update 10000)
-                        (when (> next-progress-update local-file-count)
-                          (setf next-progress-update local-file-count))
-                        (when progress-callback
-                          (funcall progress-callback file-index count good-sequence-count 9999)))
-                 do (incf count)
-                 unless (< index local-file-count)
-                   do (return-from read-loop count)
-                 if (accept-result res)
-                   do (let ((key (mapcar (lambda (digit) (del-name (row-code digit))) res)))
-                        (incf good-sequence-count)
-                        (incf (gethash key sequences 0))
-                        (when pass-file (sa:write-record pass-file title seq)))
-                 else
-                   do (when fail-file (sa:write-record fail-file title seq))
-                 finally (return-from read-loop count)))
+         (progn
+           (loop for worker in workers
+                 for thread = (bt:make-thread
+                               (lambda ()
+                                 (vformat *verbose* t "reader About to start thread~%")
+                                 (wait-for-sequence *worker*
+                                                    *queue*
+                                                    (lambda (worker-index sequence-count good-sequence-count)
+                                                      (bt:with-lock-held (callback-lock)
+                                                        (let ((tracker (elt trackers worker-index)))
+                                                          (setf (sequence-count tracker) sequence-count
+                                                                (good-sequence-count tracker) good-sequence-count))))
+                                                    :verbose verbose))
+                               :initial-bindings (list (cons '*worker* worker)
+                                                       (cons '*queue* queue)
+                                                       (cons '*verbose* verbose)))
+                 do (setf (thread worker) thread))
+           ;; Reader process
+           (vformat verbose t "About to start reader~%")
+           (loop for parser in parsers
+                 for results = (make-hash-table :test 'equal :thread-safe t)
+                 for results-lock = (bt:make-lock "results-lock")
+                 for files = (files parser)
+                 for parser-name = (name parser)
+                 with parser-sequence-count = 0
+                 for pass-fail = (when pass-fail-files
+                                   (let* ((pass-fail-dir (make-pathname :name nil :type nil :defaults (first files)))
+                                          (pass-file-name (make-pathname
+                                                           :name (format nil "~a-pass" batch-name)
+                                                           :type "fastq" :defaults pass-fail-dir))
+                                          (fail-file-name (make-pathname
+                                                           :name (format nil "~a-fail" batch-name)
+                                                           :type "fastq" :defaults pass-fail-dir)))
+                                     (make-instance 'pass-fail
+                                                    :pass-file (sa:make-seq-file-out (namestring pass-file-name))
+                                                    :pass-file-lock (bt:make-lock "pass-file-lock")
+                                                    :fail-file (sa:make-seq-file-out (namestring fail-file-name))
+                                                    :fail-file-lock (bt:make-lock "fail-file-lock"))))
+                 do (unwind-protect
+                         (loop named files-loop
+                               for file in files
+                               for seq-file = (seqan:make-seq-file-in file)
+                               do (unwind-protect
+                                       (loop named read-loop
+                                             for data = (progn
+                                                          (vformat verbose t "reader: About to pop resource~%")
+                                                          (mp:atomic-pop (car resources)))
+                                             do (progn
+                                                  (vformat verbose t "reader: About to read a record into data: ~a~%" data)
+                                                  (when (sa:at-end seq-file)
+                                                    (return-from read-loop nil))
+                                                  (sa:read-record (metadata data)
+                                                                  (seq data)
+                                                                  seq-file)
+                                                  (setf (pass-fail data) pass-fail
+                                                        (results data) results
+                                                        (results-lock data) results-lock)
+                                                  (incf sequence-count)
+                                                  (incf parser-sequence-count)
+                                                  (when (and progress-callback (= 0 (mod sequence-count 500000)))
+                                                    (bt:with-lock-held (callback-lock)
+                                                      (let ((sum-tracker (make-instance 'job-tracker)))
+                                                        (sum-trackers sum-tracker trackers)
+                                                        (multiple-value-bind (progress msg)
+                                                            (evaluate-progress start-time
+                                                                               (sequence-count sum-tracker)
+                                                                               (good-sequence-count sum-tracker)
+                                                                               estimated-sequences)
+                                                          (funcall progress-callback progress msg)))))
+                                                  (when (and max-sequences-per-parser (>= parser-sequence-count max-sequences-per-parser))
+                                                    (return-from files-loop nil))
+                                                  (vformat verbose t "reader: About to push-queue ~a~%" (sa:to-string (seq data)))
+                                                  (if (> number-of-workers 0)
+                                                      (lparallel.queue:push-queue data queue)
+                                                      (mp:atomic-push data (car resources))))) ; with no workers just push resource back
+                                    (sa:close seq-file)))
+                      (when pass-fail
+                        (sa:close (pass-file pass-fail))
+                        (sa:close (fail-file pass-fail))))
+                 finally ;; Accumulate the results
+                         (progn
+                           (vformat verbose t "reader: Accumulating worker results~%")
+                           (format t "Read ~a sequences~%" sequence-count)
+                           ;; in result
+                           (let ((filtering (make-instance 'filtering
+                                                           :name (name parser)
+                                                           :file-names (files parser)
+                                                           :sequences results
+                                                           :start-time start-time
+                                                           :current-time (get-internal-real-time)
+                                                           :total-sequence-count parser-sequence-count)))
+                             (format t "Writing results to ~a~%" (output-file-name parser))
+                             (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))))))
+      ;; Shutdown the workers
       (progn
-        (sa:close seq-file)
-        (when pass-file (sa:close pass-file))
-        (when fail-file (sa:close fail-file))))
-    sequences))
-
+        (vformat verbose t "reader: sending quit message to ~a workers~%" (length workers))
+        (loop for worker in workers
+              do (unless testing
+                   (lparallel.queue:push-queue :quit queue)))
+        ;; Wait for them to shutdown
+        (vformat verbose t "reader: waiting for ~a workers to quit~%" (length workers))
+        (loop for worker in workers
+              do (bt:join-thread (thread worker))
+              do (vformat verbose t "Worker ~a shutdown~%" worker))))
+))
 
 (defun make-job-tracker-vector (number-of-jobs)
   (let ((trackers (make-array number-of-jobs)))
     (loop for index below number-of-jobs
           do (setf (elt trackers index) (make-instance 'job-tracker)))
     trackers))
-
-(defun serial-analyze (parser &key progress-callback)
-  "Read sequences and generate an filtering"
-  (let* ((start-time (get-internal-real-time))
-         (filtering (make-instance 'filtering
-                                   :name (name parser)
-                                   :start-time start-time
-                                   :file-names (files parser))))
-    (loop for file in (files parser)
-          do (unless (probe-file file)
-               (error "Could not find file: ~a~%" file)))
-    (let ((total-count (apply '+ (num-sequences-per-file parser)))
-          (trackers (make-job-tracker-vector (length (files parser))))
-          (sum-tracker (make-instance 'job-tracker)))
-      (loop for file in (files parser)
-            for file-index from 0
-            for local-file-count in (num-sequences-per-file parser)
-            for one-file-ht = (analyze-one-file
-                               file-index file local-file-count
-                               :progress-callback
-                               (lambda (file-index count good-sequence-count seq-file-position)
-                                 (let ((tracker (elt trackers file-index)))
-                                   (setf (sequence-count tracker) count
-                                         (good-sequence-count tracker) good-sequence-count
-                                         (seq-file-position tracker) seq-file-position)
-                                   (when progress-callback
-                                     (sum-trackers sum-tracker trackers)
-                                     (multiple-value-bind (progress msg)
-                                         (evaluate-progress start-time sum-tracker total-count)
-                                       (funcall progress-callback progress msg)))))
-                               :pass-fail-files t)
-            do (maphash (lambda (seq counts)
-                          (incf (gethash seq (sequences filtering) 0) counts))
-                        one-file-ht)))
-    (format t "About to save results~%")
-    (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))
-    (when progress-callback (funcall progress-callback 100 nil :done t))
-    (format t "Finished filtering.~%")))
-
-
-(defparameter *progress-callback* nil)
-(defparameter *file-index* nil)
-(defparameter *file* nil)
-(defparameter *num-sequences* nil)
-(defparameter *trackers* nil)
-
-(defun parallel-analyze (parser &key progress-callback)
-  "Read sequences and generate an filtering"
-  (let* ((start-time (get-internal-real-time))
-         (filtering (make-instance 'filtering
-                                   :name (name parser)
-                                   :start-time start-time
-                                   :file-names (files parser))))
-    (loop for file in (files parser)
-          do (unless (probe-file file)
-               (error "Could not find file: ~a~%" file)))
-    (let* ((trackers (make-job-tracker-vector (length (files parser))))
-           (sum-total (apply #'+ (num-sequences-per-file parser)))
-           (workers (loop for file-index below (length (files parser))
-                          for file in (files parser)
-                          for num-sequences-in-file in (num-sequences-per-file parser)
-                          collect (bt:make-thread
-                                   (lambda ()
-                                     (let ((ht (analyze-one-file
-                                                *file-index* *file* *num-sequences*
-                                                :progress-callback (lambda (file-index count good-sequence-count seq-file-position)
-                                                                     (let ((tracker (elt *trackers* file-index)))
-                                                                       (setf (sequence-count tracker) count
-                                                                             (good-sequence-count tracker) good-sequence-count
-                                                                             (seq-file-position tracker) seq-file-position))))))
-                                       (setf (result (elt *trackers* *file-index*)) ht)))
-                                   :initial-bindings (list (cons '*file-index* file-index)
-                                                           (cons '*file* file)
-                                                           (cons '*num-sequences* num-sequences-in-file)
-                                                           (cons '*trackers* trackers))))))
-      (let ((sum-tracker (make-instance 'job-tracker)))
-        (loop named monitor
-              do (sleep 1)
-                 (core:check-pending-interrupts)
-                 (sum-trackers sum-tracker trackers)
-                 (when progress-callback
-                   (multiple-value-bind (progress msg)
-                       (evaluate-progress start-time sum-tracker sum-total)
-                     (funcall progress-callback progress msg)))
-                 (when (every (lambda (x) (not (bt:thread-alive-p x))) workers)
-                   (return-from monitor nil))))
-      (loop for tracker across trackers
-            for result = (result tracker)
-            do (maphash (lambda (seq counts)
-                          (incf (gethash seq (sequences filtering) 0) counts))
-                        result))
-      (format t "About to save results~%")
-      (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser))
-      (when progress-callback (funcall progress-callback 100 nil :done t))
-      (format t "Finished parsing sequences.~%"))))
 
 (defun sequence-survey (seq filtering)
   (let ((ht (make-hash-table :test 'equal)))
