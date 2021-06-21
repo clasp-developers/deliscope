@@ -28,6 +28,7 @@
    #:plot-unfiltered-counts
    #:plot-filtered-counts
 
+   #:set-number-of-threads
    #:set-data-directory
    #:compare
    #:create-sequence-parser

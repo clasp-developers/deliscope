@@ -53,6 +53,13 @@
         (finish-output)
         parser))))
 
+
+(defparameter *number-of-threads* (core:num-logical-processors))
+
+(defun set-number-of-threads (num)
+  (setf num (max 1 num))
+  (setf *number-of-threads* (min num (core:num-logical-processors))))
+
 (defparameter *progress* nil)
 (defparameter *parser* nil)
 
@@ -80,8 +87,9 @@ You can limit the number sequences loaded from each file within each parser by a
                    (format nil "Parse")
                    (lambda (instance action parsers progress-callback)
                      (declare (ignore action instance))
+                     (format t "Number of threads: ~a~%" *number-of-threads*)
                      (analyze-parsers-using-workers
-                      (core:num-logical-processors)
+                      *number-of-threads*
                       parsers
                       :max-sequences-per-file limit
                       :progress-callback
