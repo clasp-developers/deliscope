@@ -27,7 +27,11 @@
    #:process-results
    #:plot-unfiltered-counts
    #:plot-filtered-counts
-
+   #:unique-library-codes
+   #:analyze-parsers-using-workers
+   #:load-filtering
+   #:fix-library-code
+   
    #:set-number-of-threads
    #:set-data-directory
    #:compare
