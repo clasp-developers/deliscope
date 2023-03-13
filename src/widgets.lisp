@@ -1,59 +1,5 @@
 (in-package :deliscope)
 
-(defclass parsers ()
-  ((parsers :initform (make-hash-table :test 'eq :thread-safe t)
-            :initarg :parsers
-            :accessor parsers))
-  )
-
-(defun estimate-sequences-in-file (file-name &key num verbose)
-  (declare (ignore verbose))
-  (unless (probe-file file-name)
-    (error "Could not find file: ~a" file-name))
-  (if num
-      num
-      (multiple-value-bind (num-lines file-pos file-size)
-          (core:count-lines-in-file (namestring file-name) 1000000)
-          (let ((estimate-lines (floor (* (/ file-size file-pos) num-lines))))
-            (floor (/ estimate-lines 4))))))
-
-(defvar *data-directory* nil)
-(defun set-data-directory (directory)
-  (setf directory (uiop:ensure-directory-pathname (pathname directory)))
-  (unless (probe-file directory)
-    (error "The directory ~a does not exist" directory))
-  (format t "data directory set to ~a~%" directory)
-  (setf *data-directory* directory))
-
-(defun create-sequence-parser (name &rest args)
-  (let ((output-file-name (make-pathname :name (format nil "~a-results" (string-downcase (string name)))
-                                         :type "dat"))
-        (overwrite t))
-    (when (eq (car args) :output)
-      (pop args)
-      (setf output-file-name (pop args)))
-    (let* ((files args)
-           (absolute-files (mapcar (lambda (file)
-                                     (if *data-directory*
-                                         (merge-pathnames file *data-directory*)
-                                         file))
-                                   files)))
-      (format t "Scanning the files to count the number of sequences.~%")
-      (format t "This may take a few minutes - hit ii to interrupt.~%")
-      (finish-output)
-      (let* ((num-seq-per-file (mapcar (lambda (file)
-                                         (estimate-sequences-in-file file :verbose nil))
-                                       absolute-files))
-             (parser (make-instance 'parser :name name
-                                            :files absolute-files
-                                            :num-sequences-per-file num-seq-per-file
-                                            :output-file-name output-file-name
-                                            :overwrite overwrite)))
-        (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
-        (finish-output)
-        parser))))
-
-
 (defparameter *number-of-threads* (core:num-logical-processors))
 
 (defun set-number-of-threads (num)
@@ -94,7 +40,7 @@ You can limit the number sequences loaded from each file within each parser by a
                       :max-sequences-per-file limit
                       :progress-callback
                       (let ((last-val -1))
-                        (lambda (val msg &key done)
+                         (lambda (val msg &key done)
                           (if done
                               (format t "Done.~%")
                               (progn

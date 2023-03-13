@@ -60,21 +60,21 @@ when allocating align and string objects"
    (overwrite :initarg :overwrite :accessor overwrite)
    ))
 
-(defclass filtering ()
+(defclass review ()
   ((name :initarg :name :accessor name)
    (file-names :initarg :file-names :accessor file-names)
    (sequences :initform (make-hash-table :test 'equal) :initarg :sequences :accessor sequences)
    (start-time :initarg :start-time :accessor start-time)
    (current-time :initarg :current-time :accessor current-time)
-   (total-sequence-count :initform 0 :initarg :total-sequence-count :accessor total-sequence-count)
-   (good-sequence-count :initform 0 :initarg :good-sequence-count :accessor good-sequence-count)))
+   (total-read-count :initform 0 :initarg :total-read-count :accessor total-read-count)
+   (good-read-count :initform 0 :initarg :good-read-count :accessor good-read-count)))
 
-(defmethod summarize (filtering)
-  (format t "Files:~%~s~%" (file-names filtering))
-  (format t "Total sequences: ~a~%" (total-sequence-count filtering))
-  (format t "Good sequences:  ~a~%" (good-sequence-count filtering))
+(defmethod summarize (review)
+  (format t "Files:~%~s~%" (file-names review))
+  (format t "Total read: ~a~%" (total-read-count review))
+  (format t "Good read:  ~a~%" (good-read-count review))
   (format t "Sample sequences:~%")
-  (show-hash-table (sequences filtering))
+  (show-hash-table (sequences review))
   (values))
 
 (defclass worker ()
@@ -92,16 +92,31 @@ when allocating align and string objects"
    (batch-list :initarg :batch-list :accessor batch-list)))
 
 (defclass job-tracker ()
-  ((sequence-count :initform 0 :accessor sequence-count)
-   (good-sequence-count :initform 0 :accessor good-sequence-count)))
+  ((total-read-count :initform 0 :accessor total-read-count)
+   (good-read-count :initform 0 :accessor good-read-count)
+   (parser-total-read-count :initform 0 :accessor parser-total-read-count)
+   (parser-good-read-count :initform 0 :accessor parser-good-read-count)))
+
+(defun zero-parser-counts (job-tracker)
+  (setf (parser-total-read-count job-tracker) 0
+        (parser-good-read-count job-tracker) 0))
+
+(defmethod print-object ((obj job-tracker) stream)
+  (print-unreadable-object (obj stream :type t)
+    (format stream ":total-read-count ~a :good-read-count: ~a :parser-total-read-count ~a :parser-good-read-count: ~a"
+            (total-read-count obj)
+            (good-read-count obj)
+            (parser-total-read-count obj)
+            (parser-good-read-count obj)
+            )))
 
 (defun sum-trackers (sum-tracker trackers)
   (loop for index below (length trackers)
         for tracker = (elt trackers index)
-        sum (sequence-count tracker) into sequence-count-sum
-        sum (good-sequence-count tracker) into good-sequence-count-sum
-        finally (setf (sequence-count sum-tracker) sequence-count-sum
-                      (good-sequence-count sum-tracker) good-sequence-count-sum)))
+        sum (total-read-count tracker) into total-read-count-sum
+        sum (good-read-count tracker) into good-read-count-sum
+        finally (setf (total-read-count sum-tracker) total-read-count-sum
+                      (good-read-count sum-tracker) good-read-count-sum)))
 
 (defclass all-codes ()
   ((column-codes :initarg :column-codes :accessor column-codes)
@@ -131,7 +146,7 @@ when allocating align and string objects"
 
 (defmethod print-object ((object match) stream)
   (print-unreadable-object (object stream :type t)
-    (format stream "~a ~a ~a ~s"
+    (format stream "~a ~a :low-quality-count ~a ~s"
             (score object)
             (row-code object)
             (low-quality-count object)
@@ -244,6 +259,10 @@ when allocating align and string objects"
      (format (worker-log ,worker) "w~a: " (worker-index worker))
      (format (worker-log ,worker) ,fmt ,@args)))
 
+(defmacro wformat* (worker fmt &rest args)
+  `(when (worker-log ,worker)
+     (format (worker-log ,worker) ,fmt ,@args)))
+
 (defun analyze-column-using-align (worker sequence-align column-codes start adjust low-quality-count quality-string)
   (let* ((abs-start (+ start (start column-codes) adjust))
          (best-score -999999)
@@ -260,7 +279,7 @@ when allocating align and string objects"
                                                           lower-diag
                                                           upper-diag ))
           do (wformat worker "Score: ~a~%" score)
-             (wformat worker "~a~%" (sa:to-string (align sequence-align)))
+             (wformat* worker "~a~%" (sa:to-string (align sequence-align)))
           do (when (> score best-score)
                (setf best-score score
                      best-row-code row-code)))
@@ -279,7 +298,9 @@ when allocating align and string objects"
     (loop for row-code in (codes column-codes)
           for code-seq = (sequence row-code)
           when (string= seq-string code-seq :start1 (1- abs-start) :end1 (1- abs-end))
-            do (return-from analyze-column-fast (values t row-code)))
+            do (progn
+                 (wformat worker "Fast matched with row-code ~a~%" row-code)
+                 (return-from analyze-column-fast (values t row-code))))
     (values nil)))
 
 (defun analyze-column (worker sequence-align sequence-length column-codes start adjust)
@@ -292,7 +313,7 @@ when allocating align and string objects"
             (sa:count-quality-value-less-than (seq sequence-align) *minimum-phred-quality* abs-start abs-end)
           (multiple-value-bind (fast-worked row-code)
               (analyze-column-fast worker sequence-align column-codes start adjust)
-            (when fast-worked 
+            (when fast-worked
               (return-from analyze-column (make-instance 'match :score 0
                                                                 :low-quality-count low-quality-count
                                                                 :row-code row-code
@@ -329,7 +350,7 @@ when allocating align and string objects"
                               collect best-digit)))
           result)))))
 
-(defvar *filtering* (make-hash-table :test 'equal))
+(defvar *review* (make-hash-table :test 'equal))
 (defvar *bead-specific (make-hash-table :test 'equal))
 
 
@@ -338,30 +359,39 @@ when allocating align and string objects"
        (every (lambda (x) (>= (score x) -2)) result)
        (every (lambda (x) (< (low-quality-count x) *low-quality-max*)) result)))
 
-(defun evaluate-progress (start-time count good-sequence-count total-count file-sequence-count file)
+(defun evaluate-progress (start-time count good-read-count total-count file-read-count file)
   (if (= count 0)
-      (let ((msg (format nil "Read: ~a from ~a~%Parsed ~a of ~a~%Estimating remaining time...~%" file-sequence-count file count total-count)))
+      (let ((msg (format nil "Read: ~a from ~a~%Parsed ~a of ~a~%Estimating remaining time...~%" file-read-count file count total-count)))
         (values 0 msg))
       (let* ((current-time (get-internal-real-time))
              (elapsed-seconds (float (/ (- current-time start-time) internal-time-units-per-second)))
-             (remaining-seconds (if (= count 0) 9999999.0 (- (* (/ total-count count) elapsed-seconds) elapsed-seconds)))
+             (elapsed-minutes (/ elapsed-seconds 60.0))
+             (elapsed-hours (/ elapsed-minutes 60.0))
+             (total-seconds (if (= count 0) 99999999.0 (* (/ total-count count) elapsed-seconds)))
+             (remaining-seconds (- total-seconds elapsed-seconds)) ; overestimate
              (remaining-minutes (/ remaining-seconds 60.0))
              (remaining-hours (/ remaining-minutes 60.0)))
-        (multiple-value-bind (hours minutes)
-            (if (< remaining-hours 0.0)
+        (multiple-value-bind (safe-elapsed-hours safe-elapsed-minutes)
+            (if (< elapsed-hours 0.0)
                 (values 0 0)
-                (floor remaining-hours))
-          (labels ((time-description (hours minutes)
-                     (if (zerop hours)
-                         (format nil "~4,1f minute~:p" minutes)
-                         (format nil "~a hour~:p ~4,1f minute~:p" hours minutes))))
-            (let ((msg (format nil "Read ~a sequences from ~a~%Parsed ~a of ~a total sequences~%Good sequences: ~a~%Estimated remaining time: ~a~%"
-                               file-sequence-count file
-                               count total-count
-                               good-sequence-count
-                               (time-description hours (* 60.0 minutes))))
-                  (progress (floor (float (* 100.0 (/ count total-count))))))
-              (values progress msg)))))))
+                (floor elapsed-hours))
+          (multiple-value-bind (hours minutes)
+              (if (< remaining-hours 0.0)
+                  (values 0 0)
+                  (floor remaining-hours))
+            (labels ((time-description (hours minutes)
+                       (if (zerop hours)
+                           (format nil "~4,1f minute~:p" minutes)
+                           (format nil "~a hour~:p ~4,1f minute~:p" hours minutes))))
+              (let ((msg (format nil "Read ~a sequences from ~a~%Parsed ~a of ~a total reads / ~a good reads~%Elapsed time:~a   Estimated remaining time:~a~%"
+                                 file-read-count file
+                                 count total-count
+                                 good-read-count
+                                 (time-description safe-elapsed-hours (* 60.0 safe-elapsed-minutes))
+                                 (time-description hours (* 60.0 minutes))
+                                 ))
+                    (progress (floor (float (* 100.0 (/ count total-count))))))
+                (values progress msg))))))))
 
 
 (defun wait-for-sequence (worker queue &key verbose)
@@ -376,8 +406,8 @@ when allocating align and string objects"
                           (unless bbb
                             (wformat worker "got nil as bbb~%"))
                           bbb)
-            for sequence-count = 0
-            for good-sequence-count = 0
+            for total-read-count = 0
+            for good-read-count = 0
             do (wformat worker "got batch: ~a batch-list-len ~a~%" batch (length (batch-list batch)))
             do (loop named batch-loop
                      for data in (batch-list batch)
@@ -388,15 +418,21 @@ when allocating align and string objects"
                      for _1 = (wformat worker "result = ~a~%" result)
                      for good-result-or-nil = (if (accept-result result)
                                                   (progn
-                                                    (incf good-sequence-count)
+                                                    (wformat worker "Accepted result~%")
+                                                    (incf good-read-count)
                                                     (mapcar (lambda (digit) (when digit (del-name (row-code digit)))) result))
-                                                  nil)
-                     do (incf sequence-count)
+                                                  (progn
+                                                    (wformat worker "Discarded result~%")
+
+                                                    nil))
+                     do (incf total-read-count)
                      do (setf (good-result-key data) good-result-or-nil))
             do (wformat worker "Inc sequence count~%")
-            do (mp:atomic-incf (slot-value (tracker worker) 'sequence-count) sequence-count)
-            do (when (> good-sequence-count 0)
-                 (mp:atomic-incf (slot-value (tracker worker) 'good-sequence-count) good-sequence-count)
+            do (mp:atomic-incf (slot-value (tracker worker) 'total-read-count) total-read-count)
+            do (mp:atomic-incf (slot-value (tracker worker) 'parser-total-read-count) total-read-count)
+            do (when (> good-read-count 0)
+                 (mp:atomic-incf (slot-value (tracker worker) 'good-read-count) good-read-count)
+                 (mp:atomic-incf (slot-value (tracker worker) 'parser-good-read-count) good-read-count)
                  (bt:with-lock-held ((results-lock batch))
                    (loop named record-results
                          for data in (batch-list batch)
@@ -407,7 +443,7 @@ when allocating align and string objects"
                    (bt:with-lock-held ((pass-file-lock (pass-fail-data batch)))
                      (sa:write-record (pass-file (pass-fail-data batch))))))
             do (wformat worker "maybe write fail~%")
-            do (when (/= good-sequence-count sequence-count)
+            do (when (/= good-read-count total-read-count)
                  (when (pass-fail-data batch)
                    (bt:with-lock-held ((fail-file-lock (pass-fail-data batch)))
                      (sa:write-record (fail-file (pass-fail-data batch))))))
@@ -452,13 +488,13 @@ when allocating align and string objects"
                                       seq-file)
                       data))))
 
-(defun update-progress (progress-callback start-time tracker sequence-count estimated-sequences file-sequence-count file)
+(defun update-progress (progress-callback start-time tracker total-read-count estimated-sequences file-read-count file)
   (multiple-value-bind (progress msg)
       (evaluate-progress start-time
-                         sequence-count #+(or)(mp:atomic (slot-value tracker 'sequence-count))
-                         (mp:atomic (slot-value tracker 'good-sequence-count))
+                         total-read-count #+(or)(mp:atomic (slot-value tracker 'total-read-count))
+                         (mp:atomic (slot-value tracker 'good-read-count))
                          estimated-sequences
-                         file-sequence-count
+                         file-read-count
                          file)
     (funcall progress-callback progress msg)))
 
@@ -481,7 +517,7 @@ when allocating align and string objects"
   (format t "Entered analyze-files-using-workers ~a~%" parsers)
   ;; Create resources and workers
   (format t "max-sequences-per-file: ~a~%" max-sequences-per-file)
-  (let* ((sequence-count 0)
+  (let* ((total-read-count 0)
          (start-time (get-internal-real-time))
          (estimated-sequences (if max-sequences-per-file
                                   (loop for parser in parsers
@@ -516,19 +552,20 @@ when allocating align and string objects"
     (format t "Batch size: ~a~%" batch-size)
     (loop for parser in parsers
           for threads = (loop for worker in workers
-                              for thread = (bt:make-thread
-                                            (lambda ()
-                                              (wformat worker "reader About to start thread~%")
-                                              (wait-for-sequence *worker*
-                                                                 *queue*
-                                                                 :verbose verbose))
-                                            :initial-bindings (list (cons '*worker* worker)
-                                                                    (cons '*queue* queue)
-                                                                    (cons '*verbose* verbose)))
+                              for thread = (progn
+                                             (zero-parser-counts (tracker worker))
+                                             (bt:make-thread
+                                              (lambda ()
+                                                (wformat worker "reader About to start thread~%")
+                                                (wait-for-sequence *worker*
+                                                                   *queue*
+                                                                   :verbose verbose))
+                                              :initial-bindings (list (cons '*worker* worker)
+                                                                      (cons '*queue* queue)
+                                                                      (cons '*verbose* verbose))))
                               collect thread)
           for results = (make-hash-table :test 'equal :thread-safe t)
           for results-lock = (bt:make-lock "results-lock")
-          for parser-sequence-count = 0
           for parser-name = (name parser)
           for files = (files parser)
           do (unwind-protect
@@ -537,14 +574,14 @@ when allocating align and string objects"
                          (loop named files-loop
                                for file in files
                                for seq-file = (seqan:make-seq-file-in (namestring file))
-                               for file-sequence-count = 0
+                               for file-read-count = 0
                                do (unwind-protect
                                        (loop named read-loop
                                              do (when (sa:at-end seq-file)
                                                   (return-from read-loop nil))
                                              do (let ((data (read-batch batch-size seq-file resources verbose)))
-                                                  (incf sequence-count (length data))
-                                                  (incf file-sequence-count (length data))
+                                                  (incf total-read-count (length data))
+                                                  (incf file-read-count (length data))
                                                   #+(or)(format t "Reader: About to push-queue queue count: ~a~%" (lparallel.queue:queue-count queue))
                                                   (lparallel.queue:push-queue (make-instance 'batch
                                                                                              :pass-fail-data pass-fail
@@ -552,10 +589,10 @@ when allocating align and string objects"
                                                                                              :results-data results
                                                                                              :batch-list data)
                                                                               queue)
-                                                  (when (and progress-callback (>= sequence-count next-update))
+                                                  (when (and progress-callback (>= total-read-count next-update))
                                                     (incf next-update update-increment)
-                                                    (update-progress progress-callback start-time tracker sequence-count estimated-sequences file-sequence-count file))
-                                                  (when (and max-sequences-per-file (>= file-sequence-count max-sequences-per-file))
+                                                    (update-progress progress-callback start-time tracker total-read-count estimated-sequences file-read-count file))
+                                                  (when (and max-sequences-per-file (>= file-read-count max-sequences-per-file))
                                                     (return-from read-loop nil))))
                                     (sa:close seq-file)))
                       (when pass-fail
@@ -566,18 +603,20 @@ when allocating align and string objects"
           do ;; Accumulate the results
              (progn
                (format t "reader: Accumulating worker results~%")
-               (format t "Read ~a sequences~%" sequence-count)
+               (format t "Read ~a sequences~%" total-read-count)
                (format t "Results: ~s~%" results)
+               (format t "Tracker: ~s~%" tracker)
                ;; in result
-               (let* ((filtering (make-instance 'filtering
+               (let* ((review (make-instance 'review
                                                 :name (name parser)
                                                 :file-names (files parser)
                                                 :sequences results
                                                 :start-time start-time
                                                 :current-time (get-internal-real-time)
-                                                :total-sequence-count parser-sequence-count)))
+                                                :total-read-count (parser-total-read-count tracker)
+                                                :good-read-count (parser-good-read-count tracker))))
                  (format t "Writing results to ~a~%" (output-file-name parser))
-                 (save-filtering filtering (output-file-name parser) :overwrite (overwrite parser)))))
+                 (save-review review (output-file-name parser) :overwrite (overwrite parser)))))
     (format t "Wrote results to: ~a~%" (mapcar 'output-file-name parsers))
     ))
 
@@ -587,12 +626,12 @@ when allocating align and string objects"
           do (setf (elt trackers index) (make-instance 'job-tracker)))
     trackers))
 
-(defun sequence-survey (seq filtering)
+(defun sequence-survey (seq review)
   (let ((ht (make-hash-table :test 'equal)))
     (maphash (lambda (k v)
                (let ((seq-key (subseq k 1 4)))
                  (push (cons k v) (gethash seq-key ht))))
-             filtering)
+             review)
     (gethash seq ht)))
 
 (defun show-hash-table (result &optional (max-show 16))
@@ -626,7 +665,7 @@ when allocating align and string objects"
              sequences)
     library-codes))
 
-(defun bead-codes (filtering &optional (value-cutoff 150))
+(defun bead-codes (review &optional (value-cutoff 150))
   "Gather the sequences and count how many times they appear with different bead codes"
   (let ((bead-codes (make-hash-table :test 'equal)))
     (maphash (lambda (key value)
@@ -634,58 +673,90 @@ when allocating align and string objects"
                      (seq-code (subseq key 2 8)))
                  (when (>= value value-cutoff)
                    (push (list bead-code value) (gethash seq-code bead-codes)))))
-             (sequences filtering))
+             (sequences review))
     bead-codes))
 
-(defun bin-codes (filtering)
+(defun bin-codes (review)
   (let ((digit-counts (make-hash-table :test 'equal)))
     (maphash (lambda (key value)
+               (declare (ignore value))
                (loop for digit-index below 8
                      for code = (copy-seq (elt key digit-index))
                      do (setf (elt code 1) #\_)
                      do (incf (gethash code digit-counts 0))))
-             (sequences filtering))
+             (sequences review))
     digit-counts))
 
-               
+(defun safe-ratio (top bot)
+  (if (= bot 0)
+      -9999.9
+      (/ (float top) (float bot))))
 
-(defun save-filtering (filtering file &key overwrite)
+(defun describe-review (review)
+  (format t "Loaded ~a sequences for ~a~%" (hash-table-count (sequences review)) (name review))
+  (format t "   There were ~a total reads and ~a were accepted = ~5,2f%~%"
+          (total-read-count review)
+          (good-read-count review)
+          (* 100.0 (safe-ratio (good-read-count review) (total-read-count review))))
+  (let ((raw-library-codes (make-hash-table :test 'equal))
+        (short-keys (make-hash-table :test 'eql)))
+    (maphash (lambda (key value)
+               (declare (ignore value))
+               (when (< (length key) 10)
+                 (incf (gethash (length key) short-keys 0)))
+               (when (= (length key) 10)
+                 (let ((library-key (subseq key 8 10)))
+                   (incf (gethash library-key raw-library-codes 0)))))
+             (sequences review))
+    (when (> (hash-table-count short-keys) 0)
+      (format t "   Short keys:~%")
+      (maphash (lambda (k v)
+                 (format t "     length ~a num ~a~%" k v))
+               short-keys))
+    (format t "   Raw library-codes:~%")
+    (maphash (lambda (k v)
+               (format t "     ~s ~a~%" k v))
+             raw-library-codes))
+  )
+
+(defun save-review (review file &key overwrite)
   "Save the results to a file. Pass :force t if you want to force overwriting an existing file"
   (when (and (not overwrite) (probe-file file))
     (error "The file ~a already exists~%" file))
   (with-open-file (fout file :direction :output :if-exists (if overwrite :supersede))
     (let ((*print-readably* t)
           (*print-pretty* nil))
-      (prin1 (name filtering) fout)
+      (prin1 (name review) fout)
       (terpri fout)
-      (prin1 (file-names filtering) fout)
+      (prin1 (file-names review) fout)
       (terpri fout)
-      (prin1 (total-sequence-count filtering) fout)
+      (prin1 (total-read-count review) fout)
       (terpri fout)
-      (prin1 (good-sequence-count filtering) fout)
+      (prin1 (good-read-count review) fout)
       (terpri fout)
-      (prin1 (hash-table-count (sequences filtering)) fout)
+      (prin1 (hash-table-count (sequences review)) fout)
       (terpri fout)
       (maphash (lambda (k v)
                  (format fout "~s ~s~%" k v))
-               (sequences filtering))))
+               (sequences review))))
   (format t "Saved to ~a~%" file))
 
-(defun load-filtering (file)
+(defun load-review (file &key (verbose t))
   (with-open-file (fin (merge-pathnames file) :direction :input)
-    (let ((filtering (make-instance 'filtering)))
-      (setf (name filtering) (read fin))
-      (setf (file-names filtering) (read fin))
-      (setf (total-sequence-count filtering) (read fin))
-      (setf (good-sequence-count filtering) (read fin))
+    (let ((review (make-instance 'review)))
+      (setf (name review) (read fin))
+      (setf (file-names review) (read fin))
+      (setf (total-read-count review) (read fin))
+      (setf (good-read-count review) (read fin))
       (let* ((num-pairs (read fin)))
         (loop for index below num-pairs
               for key = (read fin)
               for val = (read fin)
-              do (setf (gethash key (sequences filtering)) val)))
-      filtering)))
+              do (setf (gethash key (sequences review)) val))
+        (when verbose (describe-review review))
+        review))))
 
-(defun fix-library-code (filtering library-x library-y)
+(defun fix-library-code (review library-x library-y)
   "For each key fix up the library code.
 If library-x is missing then append library-x and library-y.
 if library-x matches the key and library-y is missing then append library-y.
@@ -702,12 +773,12 @@ If both library codes are present kep the key"
                 (setf (gethash (append key (list library-x library-y)) new-seqs) value))
                (t );discard
                ))
-             (sequences filtering))
-    (setf (sequences filtering) new-seqs))
-  filtering)
+             (sequences review))
+    (setf (sequences review) new-seqs))
+  review)
 
 (defun join-codons (input)
-  (let ((filtering (make-hash-table :test 'equal)))
+  (let ((review (make-hash-table :test 'equal)))
     (maphash (lambda (key val)
                (let* ((sequence-key (subseq key 0 10))
                       (compact-sequence-key (loop for cur = sequence-key then (cddr cur)
@@ -718,9 +789,9 @@ If both library codes are present kep the key"
                                                   when cur
                                                     collect (join-del-codes msd lsd) into digits
                                                   )))
-                 (setf (gethash compact-sequence-key filtering) val)))
+                 (setf (gethash compact-sequence-key review) val)))
              input)
-    filtering))
+    review))
 
 (defun sequence-counts (input)
   (let ((counts nil))
@@ -736,13 +807,14 @@ If both library codes are present kep the key"
 (defun filter-sequences (input &optional (threshold *minimum-counts*))
   (let ((result-sequences (make-hash-table :test 'equal)))
     (maphash (lambda (key value)
-               (when (> value threshold)
+               (when (and (string= (elt key 4) *library-code*)
+                          (> value threshold))
                  (setf (gethash key result-sequences) value)))
              input)
     result-sequences))
 
-(defun bead-specific-counts (input-filtering &key (key-positions '(1 2 3)) library-code)
-  (let ((filtering (make-hash-table :test 'equal)))
+(defun bead-specific-counts (input-review &key (key-positions '(1 2 3)) library-code)
+  (let ((review (make-hash-table :test 'equal)))
     (maphash (lambda (key val)
                (declare (ignore val))
                (let ((library-key (elt key 4))
@@ -750,12 +822,12 @@ If both library codes are present kep the key"
                                          collect (elt key pos)))) 
                  (if library-code
                      (when (string= library-code library-key)
-                       (incf (gethash sequence-key filtering 0)))
-                     (incf (gethash sequence-key filtering 0)))))
-             input-filtering)
-    filtering))
+                       (incf (gethash sequence-key review 0)))
+                     (incf (gethash sequence-key review 0)))))
+             input-review)
+    review))
 
-(defclass analysis (filtering)
+(defclass analysis (review)
   ((joined-sequences :initarg :jointed-sequences :accessor joined-sequences)
    (minimum-counts :initform *minimum-counts* :accessor minimum-counts)
    (filtered-sequences :accessor filtered-sequences)
@@ -764,24 +836,37 @@ If both library codes are present kep the key"
    (redundancy :accessor redundancy)
    ))
 
+(defclass simple-hit ()
+  ((sort-day :initarg :sort-day :accessor sort-day)
+   (num-reads :initarg :num-reads :accessor num-reads)))
 
-(defun process-results (file &key (keys '(1 2 3)))
-  (let* ((analysis (load-filtering file)))
-    (change-class analysis 'analysis :keys keys)
-    (setf (joined-sequences analysis) (join-codons (sequences analysis)))
-    (setf (filtered-sequences analysis) (filter-sequences (joined-sequences analysis) (minimum-counts analysis)))
-    (setf (redundancy analysis) (bead-specific-counts (filtered-sequences analysis)
-                                                      :key-positions keys
-                                                      :library-code (library-code analysis)))
-    analysis))
+(defmethod print-object ((obj simple-hit) stream)
+  (print-unreadable-object (obj stream :type t)
+    (format stream ":sort-day ~s :num-reads ~a"
+            (sort-day obj)
+            (num-reads obj))))
 
+(defclass hit (simple-hit)
+  ((bead-code :initform nil :initarg :bead-code :accessor bead-code)))
 
-(defun raw-library-codes (analysis)
-  (let ((lib-codes (unique-library-codes (sequences analysis))))
-    (maphash (lambda (k v)
-               (format t "~s ~a~%" k v))
-             lib-codes))
-  (values))
+(defmethod print-object ((obj hit) stream)
+  (print-unreadable-object (obj stream :type t)
+    (format stream ":sort-day ~s :num-reads ~a :bead-code ~s"
+            (sort-day obj)
+            (num-reads obj)
+            (bead-code obj))))
+
+(defclass conclusion ()
+  ((results :initarg :results :accessor results)))
+
+(defun process-results (review &key (keys '(1 2 3)))
+  (change-class review 'analysis :keys keys)
+  (setf (joined-sequences review) (join-codons (sequences review)))
+  (setf (filtered-sequences review) (filter-sequences (joined-sequences review) (minimum-counts review)))
+  (setf (redundancy review) (bead-specific-counts (filtered-sequences review)
+                                                     :key-positions keys
+                                                     :library-code (library-code review)))
+  review)
 
 
 (defun filtered-library-codes (analysis)
@@ -820,11 +905,11 @@ If both library codes are present kep the key"
   (compare-list minimum-redundancy in1))
 
 (defvar *hits* nil)
-(defun sort-hits (&optional filtering)
+(defun sort-hits (&optional review)
   (let ((unsorted))
     (maphash (lambda (key value)
                (push (cons key value) unsorted))
-             filtering)
+             review)
     (setf *hits* (sort unsorted #'> :key #'cdr))
     *hits*))
 
@@ -855,6 +940,162 @@ min  - The minimum number of redundancies."
                   (>= red2 min))
           collect row))
 
+
+
+(defclass parsers ()
+  ((parsers :initform (make-hash-table :test 'eq :thread-safe t)
+            :initarg :parsers
+            :accessor parsers))
+  )
+
+(defun estimate-sequences-in-file (file-name &key num verbose)
+  (declare (ignore verbose))
+  (unless (probe-file file-name)
+    (error "Could not find file: ~a" file-name))
+  (if num
+      num
+      (multiple-value-bind (num-lines file-pos file-size)
+          (core:count-lines-in-file (namestring file-name) 1000000)
+          (let ((estimate-lines (floor (* (/ file-size file-pos) num-lines))))
+            (floor (/ estimate-lines 4))))))
+
+
+(defvar *data-directory* nil)
+(defun set-data-directory (directory)
+  (setf directory (uiop:ensure-directory-pathname (pathname directory)))
+  (unless (probe-file directory)
+    (error "The directory ~a does not exist" directory))
+  (format t "data directory set to ~a~%" directory)
+  (setf *data-directory* directory))
+
+(defun create-sequence-parser (name &rest args)
+  (let ((output-file-name (make-pathname :name (format nil "~a-results" (string-downcase (string name)))
+                                         :type "dat"))
+        (overwrite t))
+    (when (eq (car args) :output)
+      (pop args)
+      (setf output-file-name (pop args)))
+    (let* ((files args)
+           (absolute-files (mapcar (lambda (file)
+                                     (if *data-directory*
+                                         (merge-pathnames file *data-directory*)
+                                         file))
+                                   files)))
+      (format t "Scanning the files to count the number of sequences.~%")
+      (format t "This may take a few minutes - hit ii to interrupt.~%")
+      (finish-output)
+      (let* ((num-seq-per-file (mapcar (lambda (file)
+                                         (estimate-sequences-in-file file :verbose nil))
+                                       absolute-files))
+             (parser (make-instance 'parser :name name
+                                            :files absolute-files
+                                            :num-sequences-per-file num-seq-per-file
+                                            :output-file-name output-file-name
+                                            :overwrite overwrite)))
+        (format t "Number of sequences: ~a~%" (apply '+ num-seq-per-file))
+        (finish-output)
+        parser))))
+
+
+
+
+
+(defun parse-tty (parsers &key (limit nil))
+  "Usage: (parse-tty (list <parsers>...) [:limit <integer>] )
+
+Parse the sequences specified by each parser.
+You can limit the number sequences loaded from each file within each parser by adding :limit <num>.
+"
+  (declare (ignore action instance))
+  (format t "Number of threads: ~a~%" (core:num-logical-processors))
+  (analyze-parsers-using-workers
+   (core:num-logical-processors)
+   parsers
+   :max-sequences-per-file limit
+   :progress-callback (let ((last-val -1))
+                        (lambda (val msg &key done)
+                          (if done
+                              (format t "Done.~%")
+                              (progn
+                                (when (> val last-val)
+                                  (setf last-val val)
+                                  (progn
+                                    (format t "Progress: ~a~%" val)
+                                    (format t "~a~%" msg)
+                                    (finish-output)
+                                    )
+                                  )
+                                )))))
+  (values))
+
+(defun draw-conclusion-with-bead-codes (analyses)
+  (let ((result-ht (make-hash-table :test 'equalp)))
+    (loop for analysis in analyses
+          do (maphash (lambda (key value)
+                        (let* ((bead-code (elt key 0))
+                               (agg-key (subseq key 1 4))
+                               (agg-value (make-instance 'hit
+                                                         :sort-day (name analysis)
+                                                         :num-reads value
+                                                         :bead-code bead-code)))
+                          (let ((rht (alexandria:ensure-gethash agg-key result-ht (make-hash-table :test 'equalp))))
+                            (setf (gethash (list (name analysis) bead-code) rht) agg-value))))
+                      (filtered-sequences analysis)))
+    (make-instance 'conclusion
+                   :results result-ht)))
+
+
+(defun redraw-conclusion-ignoring-bead-codes (conclusion)
+  (let ((results-ht (make-hash-table :test 'equalp)))
+    (maphash (lambda (key hits)
+               (let ((sort-ht (make-hash-table)))
+                 (maphash (lambda (key hit)
+                            (declare (ignore key))
+                            (let ((simple-hit (gethash (sort-day hit) sort-ht)))
+                              (if simple-hit
+                                  (progn
+                                    (incf (num-reads hit) (num-reads simple-hit))
+                                    (push (bead-code hit) (bead-code simple-hit)))
+                                  (let ((new-simple-hit (make-instance 'hit
+                                                                       :sort-day (sort-day hit)
+                                                                       :num-reads (num-reads hit)
+                                                                       :bead-code (list (bead-code hit)))))
+                                    (setf (gethash (sort-day hit) sort-ht) new-simple-hit)))))
+                          hits)
+                 (setf (gethash key results-ht) sort-ht)))
+             (results conclusion))
+    (make-instance 'conclusion
+                   :results results-ht)))
+
+(defun write-conclusion-to-stream (conclusion stream)
+  (let ((unsorted-results nil))
+    (maphash (lambda (key value)
+               (push (cons key value) unsorted-results))
+             (results conclusion))
+    (let ((results (sort unsorted-results #'> :key (lambda (v) (hash-table-count (cdr v))))))
+      (loop for result in results
+            for key = (car result)
+            for values = (cdr result)
+            for index from 1
+            when (> (hash-table-count values) 1)
+              do (progn
+                   (format stream "#~a ~a seq: ~s~%" index (hash-table-count values) key)
+                   (maphash (lambda (key hit)
+                              (declare (ignore key))
+                              (if (bead-code hit)
+                                  (format stream "    sort-day(~a) bc(~s) reads(~8d)~%"
+                                          (sort-day hit) (bead-code hit) (num-reads hit))
+                                  (format stream "    sort-day(~a) reads(~8d)~%"
+                                          (sort-day hit) (num-reads hit))
+                                  ))
+                            values))))))
+
+(defun describe-conclusion (conclusion)
+  (write-conclusion-to-stream conclusion t))
+
+(defun write-conclusion-to-file (conclusion filename)
+  (with-open-file (fout filename :direction :output)
+    (write-conclusion-to-stream conclusion fout)))
 
 #|
 

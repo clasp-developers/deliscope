@@ -29,7 +29,7 @@
    #:plot-filtered-counts
    #:unique-library-codes
    #:analyze-parsers-using-workers
-   #:load-filtering
+   #:load-review
    #:fix-library-code
    
    #:set-number-of-threads
@@ -41,7 +41,13 @@
    #:redundancies
    #:save-csv
    #:parse
-   ))
+   #:parse-tty
+   #:describe-aggregate-analysis-results
+   #:draw-conclusion
+   #:write-conclusion-to-file
+   #:describe-conclusion
+   #:draw-conclusion-with-bead-codes
+))
    
 
 
